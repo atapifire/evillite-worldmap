@@ -1,0 +1,11 @@
+{
+  "id": "world-map",
+  "name": "World Map",
+  "author": "atapifire",
+  "version": "0.1.0",
+  "description": "Filterable, searchable top-down world map for EvilQuest, rendered from live in-game data.",
+  "entry": "dist/world-map.js",
+  "repo": "https://github.com/atapifire/evillite-worldmap",
+  "minClientVersion": "0.2.0",
+  "sha256": "53e1c3581b05d94a5c8fa52ece4add08be31b95fc0bd72bbbcef5732bb84e89e"
+}
