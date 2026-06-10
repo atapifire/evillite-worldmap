@@ -39,13 +39,19 @@ This repo is a reference example of that structure:
 ```
 src/WorldMapPlugin.ts   the plugin (extends `Plugin` from @evillite/core)
 dist/world-map.js       built ES-module bundle the client loads
+data/world-map-icons.json  prebaked model-icon cache (loaded via the core
+                        PluginAssetCache; copied into the client's plugins/data/)
 plugin.json             manifest (id, author, version, entry, sha256) for the hub
 package.json            build via esbuild; @evillite/core + @babylonjs are externals
 ```
 
-The plugin imports only from the package root `@evillite/core`, which the client
-provides at runtime via its import map — so the bundle stays tiny and never
-vendors the core.
+Persistence & assets use core services: per-map object/NPC/filter state is stored
+on the reactive `plugin.data` (auto-persisted to IndexedDB per user), and rendered
+model icons are cached via core's `PluginAssetCache` (the prebaked `data/` file
+above, so end users load icons instead of regenerating them).
+
+The plugin imports from `@evillite/core`, which the client provides at runtime via
+its import map — so the bundle stays tiny and never vendors the core.
 
 ## Build
 

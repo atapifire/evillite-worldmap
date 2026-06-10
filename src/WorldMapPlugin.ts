@@ -1,5 +1,6 @@
 import { Plugin } from '@evillite/core/src/interfaces/highlite/plugin/plugin.class';
 import { SettingsTypes, type PluginSettings } from '@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface';
+import { PluginAssetCache } from '@evillite/core/src/utilities/pluginAssetCache';
 
 /**
  * World Map plugin for EvilQuest.
@@ -279,7 +280,10 @@ export default class WorldMapPlugin extends Plugin {
 
     // ── Game data access (all by stable semantic names) ───────────────────────────
     private get gm(): any {
-        return (window as any).gm ?? null;
+        // Route through the Reflector: the GameManager instance is captured into
+        // gameHooks.GameManager.Instance by the HookManager (it's not a game-side
+        // singleton). Fall back to the raw global only until hooks have bound.
+        return this.gameHooks?.GameManager?.Instance ?? (window as any).gm ?? null;
     }
     private getChunkManager(): any {
         return this.gm?.chunkManager ?? null;
@@ -565,35 +569,38 @@ export default class WorldMapPlugin extends Plugin {
         return '#ffd24a'; // default gold
     }
 
-    // ── Persistence (localStorage, per map) ───────────────────────────────────────
-    private storageKey(kind: string): string {
-        return `evilitemap:${kind}:${this.mapId}`;
+    // ── Persistence (core plugin.data → IndexedDB, per user) ──────────────────────
+    // plugin.data is a reactive object the core PluginDataManager auto-persists
+    // (debounced) to IndexedDB keyed by the logged-in user. Shape:
+    //   this.data.maps[mapId] = { obj: ObjRecord[], npc: { defId: {name, pts[]} } }
+    //   this.data.filters     = { disabledCats, disabledNames, show*, ... }
+    private ensureDataShape() {
+        if (!this.data.maps || typeof this.data.maps !== 'object') this.data.maps = {};
+        if (!this.data.filters || typeof this.data.filters !== 'object') this.data.filters = {};
     }
 
     private loadStores() {
         try {
-            const objRaw = localStorage.getItem(this.storageKey('obj'));
-            if (objRaw) {
-                const arr = JSON.parse(objRaw) as any[];
-                for (const o of arr) {
-                    const key = `${o.x},${o.z},${o.floor},${o.defId}`;
-                    this.objectStore.set(key, { defId: o.defId, category: o.category, name: o.name, x: o.x, z: o.z, floor: o.floor, depleted: false, assetId: o.assetId ?? '' });
-                }
+            this.ensureDataShape();
+            this.migrateLegacyLocalStorage();
+            const mapData = this.data.maps[this.mapId];
+            if (!mapData) return;
+            const arr = (mapData.obj ?? []) as any[];
+            for (const o of arr) {
+                const key = `${o.x},${o.z},${o.floor},${o.defId}`;
+                this.objectStore.set(key, { defId: o.defId, category: o.category, name: o.name, x: o.x, z: o.z, floor: o.floor, depleted: false, assetId: o.assetId ?? '' });
             }
-            const npcRaw = localStorage.getItem(this.storageKey('npc'));
-            if (npcRaw) {
-                const obj = JSON.parse(npcRaw) as Record<string, { name: string; pts: number[][] }>;
-                for (const defIdStr of Object.keys(obj)) {
-                    const defId = Number(defIdStr);
-                    const entry = obj[defIdStr];
-                    const m = new Map<string, NpcSighting>();
-                    for (const p of entry.pts) {
-                        const [x, z, level] = p;
-                        m.set(`${x},${z}`, { defId, name: entry.name, x, z, level: level < 0 ? undefined : level });
-                    }
-                    this.npcStore.set(defId, m);
-                    if (!this.npcNameDef.has(entry.name)) this.npcNameDef.set(entry.name, defId);
+            const npc = (mapData.npc ?? {}) as Record<string, { name: string; pts: number[][] }>;
+            for (const defIdStr of Object.keys(npc)) {
+                const defId = Number(defIdStr);
+                const entry = npc[defIdStr];
+                const m = new Map<string, NpcSighting>();
+                for (const p of entry.pts) {
+                    const [x, z, level] = p;
+                    m.set(`${x},${z}`, { defId, name: entry.name, x, z, level: level < 0 ? undefined : level });
                 }
+                this.npcStore.set(defId, m);
+                if (!this.npcNameDef.has(entry.name)) this.npcNameDef.set(entry.name, defId);
             }
         } catch (e: any) {
             this.warn('loadStores failed: ' + (e?.message || e));
@@ -606,15 +613,16 @@ export default class WorldMapPlugin extends Plugin {
         this.lastSave = performance.now();
         this.storeDirty = false;
         try {
+            this.ensureDataShape();
             const objArr = [...this.objectStore.values()].map((o) => ({ defId: o.defId, category: o.category, name: o.name, x: o.x, z: o.z, floor: o.floor, assetId: o.assetId }));
-            localStorage.setItem(this.storageKey('obj'), JSON.stringify(objArr));
 
             const npcObj: Record<string, { name: string; pts: number[][] }> = {};
             for (const [defId, m] of this.npcStore) {
                 const first = m.values().next().value;
                 npcObj[defId] = { name: first?.name ?? `NPC #${defId}`, pts: [...m.values()].map((s) => [s.x, s.z, s.level ?? -1]) };
             }
-            localStorage.setItem(this.storageKey('npc'), JSON.stringify(npcObj));
+            // Single assignment per map -> one reactive write (debounced by core).
+            this.data.maps[this.mapId] = { obj: objArr, npc: npcObj };
         } catch (e: any) {
             this.warn('persistStores failed: ' + (e?.message || e));
         }
@@ -622,9 +630,9 @@ export default class WorldMapPlugin extends Plugin {
 
     private loadFilterState() {
         try {
-            const raw = localStorage.getItem('evilitemap:filters');
-            if (!raw) return;
-            const f = JSON.parse(raw);
+            this.ensureDataShape();
+            const f = this.data.filters;
+            if (!f || !Object.keys(f).length) return;
             this.disabledCats = new Set(f.disabledCats ?? []);
             this.disabledNames = new Set(f.disabledNames ?? []);
             this.showLiveNpcs = f.showLiveNpcs ?? true;
@@ -637,7 +645,8 @@ export default class WorldMapPlugin extends Plugin {
     }
     private saveFilterState() {
         try {
-            localStorage.setItem('evilitemap:filters', JSON.stringify({
+            this.ensureDataShape();
+            this.data.filters = {
                 disabledCats: [...this.disabledCats],
                 disabledNames: [...this.disabledNames],
                 showLiveNpcs: this.showLiveNpcs,
@@ -646,7 +655,32 @@ export default class WorldMapPlugin extends Plugin {
                 iconsEnabled: this.iconsEnabled,
                 labelsEnabled: this.labelsEnabled,
                 showMinimapMarkers: this.showMinimapMarkers,
-            }));
+            };
+        } catch { /* ignore */ }
+    }
+
+    // One-time import of pre-plugin.data localStorage (`evilitemap:*`). Best-effort:
+    // the old launch-time clearStorageData() wiped this each boot, so there's at most
+    // one session to recover; once imported we drop the legacy keys.
+    private legacyMigrated = false;
+    private migrateLegacyLocalStorage() {
+        if (this.legacyMigrated) return;
+        this.legacyMigrated = true;
+        try {
+            const objRaw = localStorage.getItem(`evilitemap:obj:${this.mapId}`);
+            const npcRaw = localStorage.getItem(`evilitemap:npc:${this.mapId}`);
+            if ((objRaw || npcRaw) && !this.data.maps[this.mapId]) {
+                this.data.maps[this.mapId] = {
+                    obj: objRaw ? JSON.parse(objRaw) : [],
+                    npc: npcRaw ? JSON.parse(npcRaw) : {},
+                };
+            }
+            const filtRaw = localStorage.getItem('evilitemap:filters');
+            if (filtRaw && !Object.keys(this.data.filters).length) {
+                this.data.filters = JSON.parse(filtRaw);
+            }
+            for (const k of ['obj', 'npc']) localStorage.removeItem(`evilitemap:${k}:${this.mapId}`);
+            localStorage.removeItem('evilitemap:filters');
         } catch { /* ignore */ }
     }
 
@@ -1491,6 +1525,9 @@ export default class WorldMapPlugin extends Plugin {
     // Icons render lazily on demand, are cached, and replace the colour/shape markers.
     private iconsEnabled = true;
     private iconCache = new Map<string, HTMLImageElement>();
+    /** Build-committed cache of rendered model icons, via the generic core asset
+     *  cache (main-process file under data/world-map-icons.json). */
+    private iconCacheStore = new PluginAssetCache('world-map-icons');
     private iconFailed = new Set<string>();
     private iconPending = new Set<string>();
     private iconQueue: { key: string; file: string }[] = [];
@@ -1522,6 +1559,11 @@ export default class WorldMapPlugin extends Plugin {
     private lastIconDiag = '';
     private offEngine: any = null;
     private offCanvas: HTMLCanvasElement | null = null;
+    // The offscreen Babylon engine accumulates GPU memory across GLB loads (textures/effects
+    // that scene.dispose() doesn't fully reclaim). Recycle it every N renders to bound RAM
+    // while STILL rendering every object (so the dev cache builds a complete map).
+    private rendersSinceEngineReset = 0;
+    private static readonly RENDERS_PER_ENGINE = 20;
 
     /**
      * Icon lookup order (cache-first, render-on-miss): in-memory → persisted
@@ -1568,8 +1610,7 @@ export default class WorldMapPlugin extends Plugin {
      *  been accumulating. Either way, cached icons skip the expensive runtime render. */
     private async loadPersistedIcons(): Promise<void> {
         try {
-            const icons: Record<string, string> | undefined =
-                await (window as any).electron?.ipcRenderer?.invoke('worldmap:load-icons');
+            const icons = await this.iconCacheStore.load();
             if (!icons) return;
             for (const key of Object.keys(icons)) {
                 const img = new Image();
@@ -1858,8 +1899,9 @@ export default class WorldMapPlugin extends Plugin {
                         const img = new Image();
                         img.src = dataUrl;
                         this.iconCache.set(key, img);
-                        // Report to main so the dev cache accumulates this icon for the build.
-                        try { (window as any).electron?.ipcRenderer?.send('worldmap:save-icon', key, dataUrl); } catch { /* ignore */ }
+                        // Report to the generic asset cache so the dev cache accumulates
+                        // this icon for the build (no-op in packaged builds).
+                        this.iconCacheStore.save(key, dataUrl);
                     } else this.iconFailed.add(key);
                 } catch (e: any) {
                     this.iconFailed.add(key);
@@ -1868,6 +1910,16 @@ export default class WorldMapPlugin extends Plugin {
                 } finally {
                     this.iconPending.delete(key);
                 }
+                // Recycle the offscreen engine periodically to release accumulated GPU
+                // memory (this is what was OOM-killing us during a full render).
+                if (++this.rendersSinceEngineReset >= WorldMapPlugin.RENDERS_PER_ENGINE) {
+                    this.rendersSinceEngineReset = 0;
+                    try { this.offEngine?.dispose(); } catch { /* ignore */ }
+                    this.offEngine = null;
+                    this.offCanvas = null;
+                }
+                // Throttle so the queue doesn't burst-allocate and the GC keeps pace.
+                await new Promise((r) => setTimeout(r, 25));
             }
         } finally {
             this.iconRendering = false;
@@ -2000,7 +2052,17 @@ export default class WorldMapPlugin extends Plugin {
             }
             return best;
         } finally {
-            try { scene?.dispose(); } catch { /* ignore */ }
+            // Aggressively free GPU resources — textures especially are the big leak across
+            // many GLB loads; scene.dispose() alone leaves engine caches behind.
+            try {
+                if (scene) {
+                    for (const t of (scene.textures ?? []).slice()) { try { t.dispose(); } catch { /**/ } }
+                    for (const m of (scene.materials ?? []).slice()) { try { m.dispose(true, true); } catch { /**/ } }
+                    for (const g of (scene.geometries ?? []).slice()) { try { g.dispose(); } catch { /**/ } }
+                    for (const mesh of (scene.meshes ?? []).slice()) { try { mesh.dispose(false, true); } catch { /**/ } }
+                    scene.dispose();
+                }
+            } catch { /* ignore */ }
         }
     }
 
