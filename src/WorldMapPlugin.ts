@@ -1017,6 +1017,12 @@ export default class WorldMapPlugin extends Plugin {
             const t = e.target as HTMLElement | null;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
             if (e.key === 'm' || e.key === 'M') this.toggleMap(this.mapOverlay?.style.display === 'none');
+            // DEV ONLY: Ctrl+Shift+B bakes the full icon cache. Gated to dev builds so it
+            // never fires for end users (in a packaged build the cache is read-only anyway).
+            if (e.ctrlKey && e.shiftKey && (e.key === 'B' || e.key === 'b') && (import.meta as any)?.env?.DEV) {
+                e.preventDefault();
+                void this.renderAllIcons();
+            }
         }, { capture: true });
     }
 
@@ -1881,6 +1887,82 @@ export default class WorldMapPlugin extends Plugin {
     /** Hard cap on queued renders — prevents OOM when many objects become visible at once. */
     private static readonly MAX_ICON_QUEUE = 40;
 
+    /** True while renderAllIcons() is bulk-baking, so the queue's MAX_ICON_QUEUE trim
+     *  is suspended (we WANT to render everything, not just what's visible). */
+    private bulkRendering = false;
+
+    /**
+     * DEV TOOL: pre-render an icon for every model the def tables / asset registry
+     * currently know about, so the prebaked cache can be completed without walking the
+     * whole map. Trigger with Ctrl+Shift+B (dev builds only); also callable directly.
+     *
+     * Deliberately resilient and best-effort, because this WON'T hold forever:
+     *   - EvilQuest plans to lock assets behind auth — any model that 404s / 401s just
+     *     gets marked failed and skipped (per-model try/catch in processIconQueue), the
+     *     pass keeps going, and the normal explore-as-you-go rendering still works.
+     *   - It only bakes what the def/registry tables expose right now; if the game moves
+     *     to streaming defs (so exploration is required again), this simply bakes less,
+     *     and the on-demand path remains the source of truth.
+     * Saves are dev-only (the main-process cache is read-only in packaged builds), so
+     * running this in a shipped build renders in memory but writes nothing.
+     */
+    public async renderAllIcons(): Promise<void> {
+        if (this.bulkRendering) { this.info('render-all: already running'); return; }
+        if (this.bjsState !== 'ready') {
+            void this.initIconSystem();
+            this.warn('render-all: icon system not ready (need to be in-game) — try again in a moment');
+            return;
+        }
+        this.bulkRendering = true;
+        try {
+            // Dedupe (key -> model file); skip anything already cached/failed/pending.
+            const jobs = new Map<string, string>();
+            const add = (key: string, file: string | null | undefined) => {
+                if (!key || !file) return;
+                if (this.iconCache.has(key) || this.iconFailed.has(key) || this.iconPending.has(key) || jobs.has(key)) return;
+                jobs.set(key, file);
+            };
+
+            // 1) Objects keyed by assetId (the primary icon identity) from the asset registry.
+            const reg = this.getAssetRegistry();
+            if (reg && typeof (reg as any).forEach === 'function') {
+                (reg as any).forEach((entry: any, assetId: any) => {
+                    const path = entry?.path;
+                    if (typeof assetId === 'string' && typeof path === 'string' && /\.glb(\?|#|$)/i.test(path)) {
+                        add('obj:' + assetId, this.objAssetFile(assetId) ?? path);
+                    }
+                });
+            }
+            // 2) Objects keyed by defId (the fallback key, e.g. trees defined that way).
+            const objDefs: any = this.gm?.objectDefsCache;
+            if (objDefs && typeof objDefs.forEach === 'function') {
+                objDefs.forEach((def: any, defId: any) => add('objdef:' + defId, this.findGlb(def) ?? this.objModelFiles?.get(Number(defId)) ?? null));
+            }
+            this.objModelFiles?.forEach((file, defId) => add('objdef:' + defId, file));
+            // 3) NPCs keyed by defId (+ the shared humanoid base for model-less defs).
+            const npcDefs: any = this.gm?.entities?.npcDefsCache;
+            if (npcDefs && typeof npcDefs.forEach === 'function') {
+                npcDefs.forEach((_def: any, defId: any) => {
+                    const file = this.modelFileFor('npc', Number(defId));
+                    if (file) add('npc:' + defId, file);
+                    else add('npc:__humanoid__', WorldMapPlugin.HUMANOID_MODEL);
+                });
+            }
+            this.npcModelFiles?.forEach((file, defId) => add('npc:' + defId, file));
+
+            const total = jobs.size;
+            this.info(`render-all: queuing ${total} models (already have ${this.iconCache.size} cached, ${this.iconFailed.size} failed)`);
+            this.sendDiag(`RENDER-ALL queuing ${total} (cached=${this.iconCache.size} failed=${this.iconFailed.size})`);
+            if (!total) return;
+            for (const [key, file] of jobs) { this.iconPending.add(key); this.iconQueue.push({ key, file }); }
+            await this.processIconQueue();
+            this.info(`render-all: done — cache now ${this.iconCache.size}, failed ${this.iconFailed.size}`);
+            this.sendDiag(`RENDER-ALL done cache=${this.iconCache.size} failed=${this.iconFailed.size}`);
+        } finally {
+            this.bulkRendering = false;
+        }
+    }
+
     private async processIconQueue(): Promise<void> {
         if (this.iconRendering || !this.bjs) return;
         this.iconRendering = true;
@@ -1888,7 +1970,7 @@ export default class WorldMapPlugin extends Plugin {
             while (this.iconQueue.length) {
                 // Trim queue if it grew too large (new objects all visible at once on first load).
                 // Drop from the tail so the nearest/most-needed items (pushed first) render first.
-                if (this.iconQueue.length > WorldMapPlugin.MAX_ICON_QUEUE) {
+                if (!this.bulkRendering && this.iconQueue.length > WorldMapPlugin.MAX_ICON_QUEUE) {
                     const dropped = this.iconQueue.splice(WorldMapPlugin.MAX_ICON_QUEUE);
                     for (const d of dropped) this.iconPending.delete(d.key);
                 }
