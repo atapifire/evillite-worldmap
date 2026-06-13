@@ -732,10 +732,20 @@ export default class WorldMapPlugin extends Plugin {
         this.mapOverlay = document.createElement('div');
         Object.assign(this.mapOverlay.style, {
             position: 'fixed', top: '6%', left: '6%', width: '88%', height: '88%',
-            backgroundColor: 'rgba(0,0,0,0.93)', border: '2px solid var(--theme-border, #444)',
+            // The container uses the game's own dark-stone tile (the same texture the vanilla
+            // UI panels/buttons use) instead of flat black, so the map window matches the
+            // rest of EvilQuest. A subtle dark overlay keeps the panel/header text readable.
+            // The tile is applied (rotated 90°) by applyContainerTexture once it loads.
+            backgroundColor: '#121212',
+            backgroundRepeat: 'repeat', backgroundSize: 'auto',
+            border: '2px solid var(--theme-border, #444)',
             borderRadius: '8px', zIndex: '2147483647', display: 'none', flexDirection: 'column',
             padding: '12px', boxSizing: 'border-box', fontFamily: 'Inter, sans-serif',
         } as CSSStyleDeclaration);
+        this.applyContainerTexture(this.mapOverlay);
+        // A freshly built overlay has an empty filter panel; clear the cached signature so
+        // the next refresh repopulates it (otherwise an unchanged dataset skips the rebuild).
+        this.panelSignature = '';
         this.mapOverlay.classList.add('highlite-ui');
 
         // Header
@@ -836,6 +846,32 @@ export default class WorldMapPlugin extends Plugin {
         document.body.appendChild(this.mapOverlay);
 
         this.installCanvasControls();
+    }
+
+    /** Apply the game's dark-stone tile to the map container, rotated 90° so the brick
+     *  courses run horizontally (matching the rest of the vanilla UI). CSS can't rotate a
+     *  background-image, so we pre-rotate the tile onto a canvas and use the data URL. The
+     *  texture is same-origin, so reading it back doesn't taint anything. */
+    private applyContainerTexture(el: HTMLElement) {
+        const overlay = 'linear-gradient(rgba(15,12,10,0.30), rgba(15,12,10,0.45))';
+        const url = 'https://evilquest.net/ui/stone-dark.png';
+        const img = new Image();
+        img.onload = () => {
+            try {
+                const w = img.naturalWidth, h = img.naturalHeight;
+                const c = document.createElement('canvas');
+                c.width = h; c.height = w; // swap dims for the 90° turn
+                const cx = c.getContext('2d')!;
+                cx.translate(c.width / 2, c.height / 2);
+                cx.rotate(Math.PI / 2);
+                cx.drawImage(img, -w / 2, -h / 2);
+                el.style.backgroundImage = `${overlay}, url("${c.toDataURL('image/png')}")`;
+            } catch {
+                el.style.backgroundImage = `${overlay}, url("${url}")`; // unrotated fallback
+            }
+        };
+        img.onerror = () => { el.style.backgroundImage = `${overlay}, url("${url}")`; };
+        img.src = url;
     }
 
     private styleButton(btn: HTMLButtonElement, bg: string) {
