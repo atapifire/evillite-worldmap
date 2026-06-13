@@ -1531,109 +1531,135 @@ export default class WorldMapPlugin extends Plugin {
         this.setStatus(`obj:${objCount} seen:${sightCount} live:${this.liveNpcs.length} z:${z.toFixed(1)}x${iconInfo}${diag}`);
     }
 
-    // ── Map export (for the wiki: standalone HTML the Hub can host + iframe) ────────
+    // ── Map export (for the wiki: standalone interactive HTML the Hub can host + iframe) ─
     /**
-     * Export the full explored map to a single self-contained HTML file — the terrain,
-     * object icons and minimap POIs baked into one PNG, wrapped in a pan/zoom viewer
-     * with a searchable POI list. Reuses the live render pipeline at a full-map viewport.
-     * Trigger: Ctrl+Shift+E.
+     * Export the explored map to a single self-contained HTML that MIRRORS the live map:
+     * the viewer re-renders terrain + icons at any zoom (sharp, not a baked image), with
+     * the same tile-grouping, icon sizing, category filters, POIs and search. Exports the
+     * DATA (terrain image + marker positions + icon images), not a flat PNG. Ctrl+Shift+E.
      */
     public async exportMap(): Promise<void> {
         const cm = this.getChunkManager();
         if (!cm) { this.warn('export: not in game'); return; }
         if (!this.rebuildWorldCanvas(cm) || !this.worldCanvas) { this.warn('export: map data not loaded'); return; }
-
         const W = this.worldW, H = this.worldH;
-        // Scale so the largest side stays within a sane bound (huge maps would OOM the canvas).
-        const MAX = 6000;
-        const scale = Math.max(1, Math.min(6, Math.floor(MAX / Math.max(W, H)) || 1));
-        const cw = W * scale, ch = H * scale;
-        this.info(`export: rendering ${W}×${H} tiles @ ${scale}px (${cw}×${ch})…`);
+        this.info(`export: gathering ${W}×${H} map data…`);
 
-        const canvas = document.createElement('canvas');
-        canvas.width = cw; canvas.height = ch;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) { this.warn('export: no 2d context'); return; }
-        ctx.fillStyle = '#0a0a0a'; ctx.fillRect(0, 0, cw, ch);
+        // Terrain as a 1px/tile PNG — the viewer scales it the same way the live map does.
+        const terrain = this.worldCanvas.toDataURL('image/png');
 
-        // Terrain (whole map, no viewport offset → srcLeft/srcTop = 0, z = scale).
-        ctx.imageSmoothingEnabled = true;
-        ctx.save(); ctx.scale(scale, scale); ctx.drawImage(this.worldCanvas, 0, 0); ctx.restore();
+        // Object icons (deduped) + one representative marker per tile (mirrors drawMarkers).
+        const iconIdx = new Map<string, number>();
+        const icons: string[] = [];
+        const idxOf = (im: HTMLImageElement | null): number => {
+            if (!im || !im.complete || !im.naturalWidth || !im.src.startsWith('data:')) return -1;
+            let i = iconIdx.get(im.src);
+            if (i === undefined) { i = icons.length; iconIdx.set(im.src, i); icons.push(im.src); }
+            return i;
+        };
+        const groups = new Map<string, MapObject[]>();
+        for (const o of this.objectStore.values()) {
+            if (o.floor !== undefined && o.floor !== this.currentFloor) continue;
+            const k = `${o.x},${o.z}`;
+            let arr = groups.get(k); if (!arr) { arr = []; groups.set(k, arr); } arr.push(o);
+        }
+        const catMap = new Map<string, { c: string; s: string }>();
+        const objects: any[] = [];
+        for (const group of groups.values()) {
+            let rep = group[0];
+            for (const g of group) { if (this.getObjectIcon(g)) rep = g; }
+            const o = rep;
+            if (!catMap.has(o.category)) catMap.set(o.category, { c: this.catColor(o.category), s: this.catShape(o.category) });
+            objects.push({ x: o.x, z: o.z, i: idxOf(this.getObjectIcon(o)), c: o.category, n: this.prettify(o.name), k: group.length, d: o.depleted ? 1 : 0 });
+        }
+        const cats = [...catMap.entries()].map(([n, v]) => ({ n, c: v.c, s: v.s })).sort((a, b) => a.n.localeCompare(b.n));
 
-        // Walls.
-        ctx.fillStyle = `rgb(${WorldMapPlugin.WALL_LINE.join(',')})`;
-        const wt = Math.max(1, scale * 0.15);
-        for (let wz = 0; wz < H; wz++) for (let wx = 0; wx < W; wx++) {
-            const wf = this.worldWalls[wz * W + wx]; if (!wf) continue;
-            const sx = wx * scale, sy = wz * scale;
-            if (wf & WorldMapPlugin.WF.N) ctx.fillRect(sx, sy, scale, wt);
-            if (wf & WorldMapPlugin.WF.S) ctx.fillRect(sx, sy + scale - wt, scale, wt);
-            if (wf & WorldMapPlugin.WF.W) ctx.fillRect(sx, sy, wt, scale);
-            if (wf & WorldMapPlugin.WF.E) ctx.fillRect(sx + scale - wt, sy, wt, scale);
+        // POIs (minimap markers) + their icons, converted to data URLs so the file is self-contained.
+        const mmIdx = new Map<string, number>();
+        const mmIcons: string[] = [];
+        const toDataUrl = (im: HTMLImageElement): string | null => {
+            try { const c = document.createElement('canvas'); c.width = im.naturalWidth; c.height = im.naturalHeight; c.getContext('2d')!.drawImage(im, 0, 0); return c.toDataURL('image/png'); } catch { return null; }
+        };
+        const pois: any[] = [];
+        for (const m of this.minimapMarkers) {
+            let mi = -1;
+            const im = this.getMmIcon(m.icon);
+            if (im && im.complete && im.naturalWidth) {
+                const du = toDataUrl(im);
+                if (du) { let i = mmIdx.get(du); if (i === undefined) { i = mmIcons.length; mmIdx.set(du, i); mmIcons.push(du); } mi = i; }
+            }
+            pois.push({ x: m.x, z: m.z, n: (m.label || m.icon).replace(/\.(png|webp)$/i, '').replace(/_/g, ' '), m: mi, s: Math.max(8, Math.min(32, m.size || 16)) });
         }
 
-        // Markers — drop transient live NPCs/players for a clean static map; keep object
-        // icons (+ sightings if enabled). Reuse drawMarkers at the full-map viewport.
-        const savedLive = this.showLiveNpcs, savedPlayers = this.showPlayers;
-        this.showLiveNpcs = false; this.showPlayers = false;
-        try { this.drawMarkers(ctx, cw, ch, 0, 0, scale); } catch (e: any) { this.warn('export markers: ' + (e?.message || e)); }
-        this.showLiveNpcs = savedLive; this.showPlayers = savedPlayers;
-        try { this.drawMinimapMarkers(ctx, cw, ch, 0, 0, scale); } catch { /* ignore */ }
-
-        const png = canvas.toDataURL('image/png');
-        // Searchable POIs for the viewer: named minimap markers (world coords).
-        const pois = this.minimapMarkers
-            .filter(m => m.label || m.icon)
-            .map(m => ({ name: (m.label || m.icon).replace(/\.(png|webp)$/i, '').replace(/_/g, ' '), x: Math.round(m.x), z: Math.round(m.z) }));
-
-        const html = this.buildExportHtml(png, cw, ch, scale, this.mapId || 'world', pois);
-        this.downloadFile(`evilquest-map-${this.mapId || 'world'}.html`, html);
-        this.info(`export: done — ${pois.length} POIs, saved standalone HTML.`);
+        const data = { id: this.mapId || 'world', W, H, t: terrain, ic: icons, ob: objects, ct: cats, pi: pois, mm: mmIcons };
+        this.downloadFile(`evilquest-map-${this.mapId || 'world'}.html`, this.buildExportHtml(data));
+        this.info(`export: done — ${objects.length} markers, ${icons.length} icons, ${pois.length} POIs.`);
     }
 
-    /** Build the standalone viewer: pan/zoom the baked PNG + a searchable POI sidebar. */
-    private buildExportHtml(pngDataUrl: string, cw: number, ch: number, scale: number, mapId: string, pois: { name: string; x: number; z: number }[]): string {
-        const poiJson = JSON.stringify(pois);
-        // Self-contained: no external deps, image inlined, works inside an <iframe>.
-        return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EvilQuest World Map — ${mapId}</title>
-<style>
-  html,body{margin:0;height:100%;background:#111;color:#eee;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden}
-  #app{display:flex;height:100%}
-  #side{width:230px;flex:none;background:#1b1b1b;border-right:1px solid #333;display:flex;flex-direction:column}
-  #side h1{font-size:14px;margin:0;padding:12px;border-bottom:1px solid #333}
-  #q{margin:8px;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#111;color:#fff}
-  #list{overflow:auto;flex:1}
-  .poi{padding:6px 12px;cursor:pointer;border-bottom:1px solid #262626;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .poi:hover{background:#2a2a2a}
-  #view{flex:1;position:relative;overflow:hidden;cursor:grab;background:#0a0a0a}
-  #view.drag{cursor:grabbing}
-  #img{position:absolute;left:0;top:0;transform-origin:0 0;image-rendering:auto}
-  #hint{position:absolute;right:8px;bottom:8px;background:#000a;padding:4px 8px;border-radius:4px;font-size:11px}
-</style></head><body><div id="app">
-  <div id="side"><h1>World Map — ${mapId}</h1><input id="q" placeholder="Search POIs…"><div id="list"></div></div>
-  <div id="view"><img id="img" src="${pngDataUrl}"></div>
-</div><div id="hint">drag to pan · scroll to zoom</div>
-<script>
-  var SCALE=${scale}, POIS=${poiJson};
-  var view=document.getElementById('view'), img=document.getElementById('img'), list=document.getElementById('list'), q=document.getElementById('q');
-  var s=1,tx=0,ty=0;
-  function apply(){img.style.transform='translate('+tx+'px,'+ty+'px) scale('+s+')';}
-  function fit(){ var r=view.getBoundingClientRect(); s=Math.min(r.width/${cw}, r.height/${ch}); tx=(r.width-${cw}*s)/2; ty=(r.height-${ch}*s)/2; apply(); }
-  img.onload=fit; if(img.complete)fit(); window.onresize=fit;
-  // pan
-  var dragging=false,lx=0,ly=0;
-  view.addEventListener('mousedown',function(e){dragging=true;lx=e.clientX;ly=e.clientY;view.classList.add('drag');});
-  window.addEventListener('mouseup',function(){dragging=false;view.classList.remove('drag');});
-  window.addEventListener('mousemove',function(e){if(!dragging)return;tx+=e.clientX-lx;ty+=e.clientY-ly;lx=e.clientX;ly=e.clientY;apply();});
-  // zoom toward cursor
-  view.addEventListener('wheel',function(e){e.preventDefault();var r=view.getBoundingClientRect();var mx=e.clientX-r.left,my=e.clientY-r.top;var f=e.deltaY<0?1.15:1/1.15;var ns=Math.max(0.05,Math.min(s*f,12));tx=mx-(mx-tx)*(ns/s);ty=my-(my-ty)*(ns/s);s=ns;apply();},{passive:false});
-  // center the view on a world coord
-  function goTo(wx,wz){var r=view.getBoundingClientRect();s=Math.max(s,1.5);tx=r.width/2 - wx*SCALE*s;ty=r.height/2 - wz*SCALE*s;apply();}
-  function renderList(filter){list.innerHTML='';POIS.filter(function(p){return !filter||p.name.toLowerCase().indexOf(filter)>=0;}).sort(function(a,b){return a.name.localeCompare(b.name);}).forEach(function(p){var d=document.createElement('div');d.className='poi';d.textContent=p.name;d.onclick=function(){goTo(p.x,p.z);};list.appendChild(d);});}
-  q.oninput=function(){renderList(q.value.trim().toLowerCase());};
-  renderList('');
-</script></body></html>`;
+    /** A self-contained interactive viewer that re-renders the exported data exactly like
+     *  the live World Map (terrain scaling, icon sizing, category filters, POIs, search). */
+    private buildExportHtml(data: any): string {
+        const json = JSON.stringify(data);
+        return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
++ '<title>EvilQuest World Map - ' + data.id + '</title><style>'
++ 'html,body{margin:0;height:100%;background:#111;color:#eee;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden}'
++ '#app{display:flex;height:100%}#side{width:220px;flex:none;background:#1b1b1b;border-right:1px solid #333;display:flex;flex-direction:column}'
++ '#side h1{font-size:14px;margin:0;padding:10px 12px;border-bottom:1px solid #333}#q{margin:8px;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#111;color:#fff}'
++ '#layers{padding:6px 12px;border-bottom:1px solid #333}#layers label,#cats label{display:block;padding:3px 0;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
++ '#cats{overflow:auto;flex:1;padding:6px 10px}#cats .cat{margin-bottom:1px}'
++ '#cats .chead{display:flex;align-items:center;padding:3px 0}#cats .chead .cn{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default}'
++ '#cats .exp{cursor:pointer;padding:0 5px;color:#9aa;user-select:none}#cats .subs{padding-left:20px}'
++ '#cats .sub{display:block;padding:2px 0;font-size:12px;color:#bbb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}'
++ '#cats .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 6px;vertical-align:middle}'
++ '#view{flex:1;position:relative;overflow:hidden;background:#0a0a0a;cursor:grab}#view.drag{cursor:grabbing}#c{position:absolute;inset:0}'
++ '#tip{position:absolute;background:#000d;border:1px solid #444;border-radius:4px;padding:4px 7px;font-size:12px;pointer-events:none;display:none;max-width:240px}'
++ '#hint{position:absolute;right:8px;bottom:8px;background:#000a;padding:4px 8px;border-radius:4px;font-size:11px;pointer-events:none}'
++ '</style></head><body><div id="app"><div id="side"><h1>World Map - ' + data.id + '</h1>'
++ '<input id="q" placeholder="Search..."><div id="layers"><label><input type="checkbox" id="L_ic" checked> Model icons</label>'
++ '<label><input type="checkbox" id="L_poi" checked> Minimap markers</label><label><input type="checkbox" id="L_lab"> Labels</label></div>'
++ '<div id="cats"></div></div><div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan - scroll to zoom</div></div></div>'
++ '<script>(function(){var D=' + json + ';'
++ 'var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");'
++ 'var terrain=new Image();terrain.src=D.t;var ICONS=D.ic.map(function(s){var i=new Image();i.src=s;return i;});var MM=D.mm.map(function(s){var i=new Image();i.src=s;return i;});'
++ 'var TAX={},nameOn={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});Object.keys(TAX).forEach(function(c){Object.keys(TAX[c]).forEach(function(n){nameOn[c+"|"+n]=true;});});var showIcons=true,showPoi=true,showLab=false;'
++ 'var cx=D.W/2,cz=D.H/2,Z=4,W=0,Hh=0,hits=[];'
++ 'function resize(){var r=view.getBoundingClientRect();W=cv.width=Math.floor(r.width);Hh=cv.height=Math.floor(r.height);render();}'
++ 'function clamp(v,a,b){return Math.max(a,Math.min(v,b));}'
++ 'function render(){if(!W)return;hits=[];ctx.fillStyle="#0a0a0a";ctx.fillRect(0,0,W,Hh);'
++ 'var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);'
++ 'if(terrain.complete&&terrain.naturalWidth){ctx.imageSmoothingEnabled=true;ctx.save();ctx.translate(-sl*Z,-st*Z);ctx.scale(Z,Z);ctx.drawImage(terrain,0,0);ctx.restore();}'
++ 'if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x+0.5-sl)*Z,sy=(o.z+0.5-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;'
++ 'var hr;if(o.i>=0&&ICONS[o.i].complete&&ICONS[o.i].naturalWidth){var sz=clamp(Z*3,24,50);ctx.save();ctx.globalAlpha=o.d?0.45:1;ctx.shadowColor="rgba(0,0,0,.55)";ctx.shadowBlur=2;ctx.drawImage(ICONS[o.i],sx-sz/2,sy-sz/2,sz,sz);ctx.restore();hr=sz/2;}'
++ 'else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);ctx.fillStyle=col;ctx.globalAlpha=o.d?0.4:1;ctx.beginPath();ctx.arc(sx,sy,br,0,6.28);ctx.fill();ctx.globalAlpha=1;hr=br;}'
++ 'if(o.k>1){ctx.fillStyle="#c0392b";ctx.beginPath();ctx.arc(sx+hr*0.8,sy-hr*0.8,6,0,6.28);ctx.fill();ctx.fillStyle="#fff";ctx.font="9px sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(o.k>9?"9+":""+o.k,sx+hr*0.8,sy-hr*0.8);}'
++ 'hits.push({sx:sx,sy:sy,r:hr,n:o.n+(o.k>1?" +"+(o.k-1):""),s:o.c+" - "+o.x+","+o.z});'
++ 'if(showLab){ctx.fillStyle="#fff";ctx.font="11px sans-serif";ctx.textAlign="center";ctx.textBaseline="bottom";ctx.shadowColor="#000";ctx.shadowBlur=3;ctx.fillText(o.n,sx,sy-hr-2);ctx.shadowBlur=0;}}}'
++ 'if(showPoi){for(var p=0;p<D.pi.length;p++){var P=D.pi[p];var px=(P.x+0.5-sl)*Z,py=(P.z+0.5-st)*Z;if(px<-30||px>W+30||py<-30||py>Hh+30)continue;var u=P.s;'
++ 'ctx.save();ctx.globalAlpha=0.7;ctx.fillStyle="rgba(0,0,0,.68)";ctx.beginPath();ctx.arc(px,py,u*0.55,0,6.28);ctx.fill();ctx.restore();'
++ 'if(P.m>=0&&MM[P.m].complete&&MM[P.m].naturalWidth)ctx.drawImage(MM[P.m],px-u/2,py-u/2,u,u);hits.push({sx:px,sy:py,r:u/2,n:P.n,s:P.x+","+P.z});}}}'
++ 'function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}'
++ 'var dragging=false,lx=0,ly=0,moved=false;'
++ 'view.addEventListener("mousedown",function(e){dragging=true;moved=false;lx=e.clientX;ly=e.clientY;view.classList.add("drag");});'
++ 'window.addEventListener("mouseup",function(){dragging=false;view.classList.remove("drag");});'
++ 'view.addEventListener("mousemove",function(e){if(dragging){var dx=e.clientX-lx,dy=e.clientY-ly;if(Math.abs(dx)+Math.abs(dy)>2)moved=true;cx-=dx/Z;cz-=dy/Z;lx=e.clientX;ly=e.clientY;render();tip.style.display="none";return;}'
++ 'var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}'
++ 'if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});'
++ 'view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});'
++ 'function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}'
++ 'function buildTax(){var box=document.getElementById("cats");box.innerHTML="";var esc=function(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;};'
++ 'Object.keys(TAX).sort().forEach(function(c){var col=(D.ct.filter(function(x){return x.n==c;})[0]||{c:"#ffd24a"}).c;var names=Object.keys(TAX[c]).sort();var tot=0;names.forEach(function(n){tot+=TAX[c][n];});'
++ 'var g=document.createElement("div");g.className="cat";var head=document.createElement("div");head.className="chead";'
++ 'head.innerHTML="<input type=checkbox class=cc checked><span class=sw style=background:"+col+"></span><span class=cn>"+esc(c)+" ("+tot+")</span><span class=exp>\\u25b8</span>";'
++ 'var subs=document.createElement("div");subs.className="subs";subs.style.display="none";'
++ 'names.forEach(function(n){var l=document.createElement("label");l.className="sub";l.innerHTML="<input type=checkbox class=nc checked> "+esc(n)+" ("+TAX[c][n]+")";'
++ 'var nb=l.querySelector("input");nb.onchange=function(){nameOn[c+"|"+n]=nb.checked;var any=names.some(function(x){return nameOn[c+"|"+x]!==false;});head.querySelector(".cc").checked=any;render();};subs.appendChild(l);});'
++ 'var cc=head.querySelector(".cc");cc.onchange=function(){var on=cc.checked;names.forEach(function(n){nameOn[c+"|"+n]=on;});subs.querySelectorAll(".nc").forEach(function(x){x.checked=on;});render();};'
++ 'head.querySelector(".exp").onclick=function(){var open=subs.style.display==="none";subs.style.display=open?"block":"none";this.textContent=open?"\\u25be":"\\u25b8";};'
++ 'g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}'
++ 'document.getElementById("L_ic").onchange=function(e){showIcons=e.target.checked;render();};document.getElementById("L_poi").onchange=function(e){showPoi=e.target.checked;render();};document.getElementById("L_lab").onchange=function(e){showLab=e.target.checked;render();};'
++ 'q.oninput=function(){var s=q.value.trim().toLowerCase();if(!s)return;var best=null,bd=1e9;function consider(x,z,n){if(n.toLowerCase().indexOf(s)<0)return;var d=(x-cx)*(x-cx)+(z-cz)*(z-cz);if(d<bd){bd=d;best=[x,z];}}D.ob.forEach(function(o){consider(o.x,o.z,o.n+" "+o.c);});D.pi.forEach(function(P){consider(P.x,P.z,P.n);});if(best)goTo(best[0],best[1]);};'
++ 'buildTax();window.addEventListener("resize",resize);var ld=0;[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",function(){if(++ld%40==0)render();});});setTimeout(render,400);setTimeout(render,1500);'
++ 'resize();fit();})();</script></body></html>';
     }
 
     /** Save text to a file via a download link (lands in the user's Downloads). */
