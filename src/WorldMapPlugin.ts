@@ -147,6 +147,7 @@ export default class WorldMapPlugin extends Plugin {
     private hitTargets: HitTarget[] = [];
     private hoverPos: { x: number; y: number } | null = null;
     private floorLabelEl: HTMLSpanElement | null = null;
+    private floorControlsEl: HTMLDivElement | null = null;
 
     private static readonly NPC_CAT = '__npc__';
     private static readonly MAX_SIGHTINGS_PER_NPC = 240;
@@ -722,7 +723,7 @@ export default class WorldMapPlugin extends Plugin {
     // ── Overlay UI ────────────────────────────────────────────────────────────────
     private updateFloorLabel() {
         if (this.floorLabelEl) {
-            this.floorLabelEl.innerText = `Floor: ${this.currentFloor}`;
+            this.floorLabelEl.innerText = `Floor ${this.currentFloor}`;
         }
     }
 
@@ -787,25 +788,43 @@ export default class WorldMapPlugin extends Plugin {
         closeBtn.onmouseleave = () => { closeBtn.style.color = '#ccc'; closeBtn.style.backgroundColor = 'transparent'; };
         closeBtn.onclick = () => this.toggleMap(false);
 
+        // Compact floor stepper: ▾ [Floor n] ▴ grouped into one pill. Always visible so
+        // you can always see which floor you're on and step up/down between levels.
+        const styleFloorBtn = (b: HTMLButtonElement) => Object.assign(b.style, {
+            padding: '2px 7px', cursor: 'pointer', backgroundColor: 'transparent', border: 'none',
+            borderRadius: '4px', color: '#cfd6dc', fontSize: '12px', lineHeight: '1',
+        } as CSSStyleDeclaration);
+        const hoverFloorBtn = (b: HTMLButtonElement) => {
+            b.onmouseenter = () => { b.style.backgroundColor = '#3a4046'; };
+            b.onmouseleave = () => { b.style.backgroundColor = 'transparent'; };
+        };
+
         const floorDownBtn = document.createElement('button');
-        floorDownBtn.innerText = '▼';
-        this.styleButton(floorDownBtn, '#2c3e50');
-        floorDownBtn.title = 'Floor Down';
+        floorDownBtn.innerText = '▾';
+        styleFloorBtn(floorDownBtn); hoverFloorBtn(floorDownBtn);
+        floorDownBtn.title = 'Floor down';
         floorDownBtn.onclick = () => { this.setFollow(false); this.currentFloor--; this.worldCanvas = null; this.updateFloorLabel(); };
 
         this.floorLabelEl = document.createElement('span');
-        this.updateFloorLabel();
-        Object.assign(this.floorLabelEl.style, { fontWeight: 'bold', minWidth: '60px', textAlign: 'center', userSelect: 'none' } as CSSStyleDeclaration);
+        Object.assign(this.floorLabelEl.style, { fontWeight: '600', minWidth: '50px', textAlign: 'center', userSelect: 'none', fontSize: '12px' } as CSSStyleDeclaration);
 
         const floorUpBtn = document.createElement('button');
-        floorUpBtn.innerText = '▲';
-        this.styleButton(floorUpBtn, '#2c3e50');
-        floorUpBtn.title = 'Floor Up';
+        floorUpBtn.innerText = '▴';
+        styleFloorBtn(floorUpBtn); hoverFloorBtn(floorUpBtn);
+        floorUpBtn.title = 'Floor up';
         floorUpBtn.onclick = () => { this.setFollow(false); this.currentFloor++; this.worldCanvas = null; this.updateFloorLabel(); };
+
+        this.floorControlsEl = document.createElement('div');
+        Object.assign(this.floorControlsEl.style, {
+            display: 'flex', alignItems: 'center', gap: '1px',
+            background: 'rgba(0,0,0,0.28)', borderRadius: '6px', padding: '2px 3px',
+        } as CSSStyleDeclaration);
+        this.floorControlsEl.append(floorDownBtn, this.floorLabelEl, floorUpBtn);
+        this.updateFloorLabel(); // set initial label text
 
         const right = document.createElement('div');
         Object.assign(right.style, { display: 'flex', gap: '8px', alignItems: 'center' } as CSSStyleDeclaration);
-        right.append(floorDownBtn, this.floorLabelEl, floorUpBtn, this.followBtn, closeBtn);
+        right.append(this.floorControlsEl, this.followBtn, closeBtn);
         header.append(title, this.searchInput, jumpBtn, right);
 
         // Full-width status strip below the header (never truncated).
