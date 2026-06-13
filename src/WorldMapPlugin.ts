@@ -752,14 +752,16 @@ export default class WorldMapPlugin extends Plugin {
             flex: '1', maxWidth: '320px', padding: '6px 10px', borderRadius: '4px',
             border: '1px solid #555', background: '#1a1a1a', color: '#fff', fontSize: '13px',
         } as CSSStyleDeclaration);
-        this.searchInput.oninput = () => { this.searchStr = this.searchInput!.value.trim().toLowerCase(); };
-        this.searchInput.onkeydown = (e) => { if (e.key === 'Enter') this.jumpToNearestMatch(); e.stopPropagation(); };
-
         const jumpBtn = document.createElement('button');
         jumpBtn.innerText = 'Jump';
         this.styleButton(jumpBtn, '#2c3e50');
-        jumpBtn.title = 'Centre on the nearest search match';
+        jumpBtn.title = 'Centre on the nearest search match (or press Enter)';
         jumpBtn.onclick = () => this.jumpToNearestMatch();
+        // Jump only makes sense with a query — keep it disabled/dimmed until there's text.
+        const syncJump = () => { const on = !!this.searchStr; jumpBtn.disabled = !on; jumpBtn.style.opacity = on ? '1' : '0.4'; jumpBtn.style.cursor = on ? 'pointer' : 'default'; };
+        this.searchInput.oninput = () => { this.searchStr = this.searchInput!.value.trim().toLowerCase(); syncJump(); };
+        this.searchInput.onkeydown = (e) => { if (e.key === 'Enter') this.jumpToNearestMatch(); e.stopPropagation(); };
+        syncJump();
 
         this.followBtn = document.createElement('button');
         this.styleButton(this.followBtn, '#27ae60');
@@ -1023,6 +1025,11 @@ export default class WorldMapPlugin extends Plugin {
             if (e.ctrlKey && e.shiftKey && (e.key === 'B' || e.key === 'b') && (import.meta as any)?.env?.DEV) {
                 e.preventDefault();
                 void this.renderAllIcons();
+            }
+            // Export the full map to a standalone HTML (for the wiki/hub). Ctrl+Shift+E.
+            if (e.ctrlKey && e.shiftKey && (e.key === 'E' || e.key === 'e')) {
+                e.preventDefault();
+                void this.exportMap();
             }
         }, { capture: true });
     }
@@ -1522,6 +1529,123 @@ export default class WorldMapPlugin extends Plugin {
             : '';
         const diag = this.lastIconDiag ? `  ·  ${this.lastIconDiag}` : '';
         this.setStatus(`obj:${objCount} seen:${sightCount} live:${this.liveNpcs.length} z:${z.toFixed(1)}x${iconInfo}${diag}`);
+    }
+
+    // ── Map export (for the wiki: standalone HTML the Hub can host + iframe) ────────
+    /**
+     * Export the full explored map to a single self-contained HTML file — the terrain,
+     * object icons and minimap POIs baked into one PNG, wrapped in a pan/zoom viewer
+     * with a searchable POI list. Reuses the live render pipeline at a full-map viewport.
+     * Trigger: Ctrl+Shift+E.
+     */
+    public async exportMap(): Promise<void> {
+        const cm = this.getChunkManager();
+        if (!cm) { this.warn('export: not in game'); return; }
+        if (!this.rebuildWorldCanvas(cm) || !this.worldCanvas) { this.warn('export: map data not loaded'); return; }
+
+        const W = this.worldW, H = this.worldH;
+        // Scale so the largest side stays within a sane bound (huge maps would OOM the canvas).
+        const MAX = 6000;
+        const scale = Math.max(1, Math.min(6, Math.floor(MAX / Math.max(W, H)) || 1));
+        const cw = W * scale, ch = H * scale;
+        this.info(`export: rendering ${W}×${H} tiles @ ${scale}px (${cw}×${ch})…`);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = cw; canvas.height = ch;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { this.warn('export: no 2d context'); return; }
+        ctx.fillStyle = '#0a0a0a'; ctx.fillRect(0, 0, cw, ch);
+
+        // Terrain (whole map, no viewport offset → srcLeft/srcTop = 0, z = scale).
+        ctx.imageSmoothingEnabled = true;
+        ctx.save(); ctx.scale(scale, scale); ctx.drawImage(this.worldCanvas, 0, 0); ctx.restore();
+
+        // Walls.
+        ctx.fillStyle = `rgb(${WorldMapPlugin.WALL_LINE.join(',')})`;
+        const wt = Math.max(1, scale * 0.15);
+        for (let wz = 0; wz < H; wz++) for (let wx = 0; wx < W; wx++) {
+            const wf = this.worldWalls[wz * W + wx]; if (!wf) continue;
+            const sx = wx * scale, sy = wz * scale;
+            if (wf & WorldMapPlugin.WF.N) ctx.fillRect(sx, sy, scale, wt);
+            if (wf & WorldMapPlugin.WF.S) ctx.fillRect(sx, sy + scale - wt, scale, wt);
+            if (wf & WorldMapPlugin.WF.W) ctx.fillRect(sx, sy, wt, scale);
+            if (wf & WorldMapPlugin.WF.E) ctx.fillRect(sx + scale - wt, sy, wt, scale);
+        }
+
+        // Markers — drop transient live NPCs/players for a clean static map; keep object
+        // icons (+ sightings if enabled). Reuse drawMarkers at the full-map viewport.
+        const savedLive = this.showLiveNpcs, savedPlayers = this.showPlayers;
+        this.showLiveNpcs = false; this.showPlayers = false;
+        try { this.drawMarkers(ctx, cw, ch, 0, 0, scale); } catch (e: any) { this.warn('export markers: ' + (e?.message || e)); }
+        this.showLiveNpcs = savedLive; this.showPlayers = savedPlayers;
+        try { this.drawMinimapMarkers(ctx, cw, ch, 0, 0, scale); } catch { /* ignore */ }
+
+        const png = canvas.toDataURL('image/png');
+        // Searchable POIs for the viewer: named minimap markers (world coords).
+        const pois = this.minimapMarkers
+            .filter(m => m.label || m.icon)
+            .map(m => ({ name: (m.label || m.icon).replace(/\.(png|webp)$/i, '').replace(/_/g, ' '), x: Math.round(m.x), z: Math.round(m.z) }));
+
+        const html = this.buildExportHtml(png, cw, ch, scale, this.mapId || 'world', pois);
+        this.downloadFile(`evilquest-map-${this.mapId || 'world'}.html`, html);
+        this.info(`export: done — ${pois.length} POIs, saved standalone HTML.`);
+    }
+
+    /** Build the standalone viewer: pan/zoom the baked PNG + a searchable POI sidebar. */
+    private buildExportHtml(pngDataUrl: string, cw: number, ch: number, scale: number, mapId: string, pois: { name: string; x: number; z: number }[]): string {
+        const poiJson = JSON.stringify(pois);
+        // Self-contained: no external deps, image inlined, works inside an <iframe>.
+        return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EvilQuest World Map — ${mapId}</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;color:#eee;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden}
+  #app{display:flex;height:100%}
+  #side{width:230px;flex:none;background:#1b1b1b;border-right:1px solid #333;display:flex;flex-direction:column}
+  #side h1{font-size:14px;margin:0;padding:12px;border-bottom:1px solid #333}
+  #q{margin:8px;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#111;color:#fff}
+  #list{overflow:auto;flex:1}
+  .poi{padding:6px 12px;cursor:pointer;border-bottom:1px solid #262626;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .poi:hover{background:#2a2a2a}
+  #view{flex:1;position:relative;overflow:hidden;cursor:grab;background:#0a0a0a}
+  #view.drag{cursor:grabbing}
+  #img{position:absolute;left:0;top:0;transform-origin:0 0;image-rendering:auto}
+  #hint{position:absolute;right:8px;bottom:8px;background:#000a;padding:4px 8px;border-radius:4px;font-size:11px}
+</style></head><body><div id="app">
+  <div id="side"><h1>World Map — ${mapId}</h1><input id="q" placeholder="Search POIs…"><div id="list"></div></div>
+  <div id="view"><img id="img" src="${pngDataUrl}"></div>
+</div><div id="hint">drag to pan · scroll to zoom</div>
+<script>
+  var SCALE=${scale}, POIS=${poiJson};
+  var view=document.getElementById('view'), img=document.getElementById('img'), list=document.getElementById('list'), q=document.getElementById('q');
+  var s=1,tx=0,ty=0;
+  function apply(){img.style.transform='translate('+tx+'px,'+ty+'px) scale('+s+')';}
+  function fit(){ var r=view.getBoundingClientRect(); s=Math.min(r.width/${cw}, r.height/${ch}); tx=(r.width-${cw}*s)/2; ty=(r.height-${ch}*s)/2; apply(); }
+  img.onload=fit; if(img.complete)fit(); window.onresize=fit;
+  // pan
+  var dragging=false,lx=0,ly=0;
+  view.addEventListener('mousedown',function(e){dragging=true;lx=e.clientX;ly=e.clientY;view.classList.add('drag');});
+  window.addEventListener('mouseup',function(){dragging=false;view.classList.remove('drag');});
+  window.addEventListener('mousemove',function(e){if(!dragging)return;tx+=e.clientX-lx;ty+=e.clientY-ly;lx=e.clientX;ly=e.clientY;apply();});
+  // zoom toward cursor
+  view.addEventListener('wheel',function(e){e.preventDefault();var r=view.getBoundingClientRect();var mx=e.clientX-r.left,my=e.clientY-r.top;var f=e.deltaY<0?1.15:1/1.15;var ns=Math.max(0.05,Math.min(s*f,12));tx=mx-(mx-tx)*(ns/s);ty=my-(my-ty)*(ns/s);s=ns;apply();},{passive:false});
+  // center the view on a world coord
+  function goTo(wx,wz){var r=view.getBoundingClientRect();s=Math.max(s,1.5);tx=r.width/2 - wx*SCALE*s;ty=r.height/2 - wz*SCALE*s;apply();}
+  function renderList(filter){list.innerHTML='';POIS.filter(function(p){return !filter||p.name.toLowerCase().indexOf(filter)>=0;}).sort(function(a,b){return a.name.localeCompare(b.name);}).forEach(function(p){var d=document.createElement('div');d.className='poi';d.textContent=p.name;d.onclick=function(){goTo(p.x,p.z);};list.appendChild(d);});}
+  q.oninput=function(){renderList(q.value.trim().toLowerCase());};
+  renderList('');
+</script></body></html>`;
+    }
+
+    /** Save text to a file via a download link (lands in the user's Downloads). */
+    private downloadFile(name: string, content: string) {
+        try {
+            const blob = new Blob([content], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = name;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 4000);
+        } catch (e: any) { this.warn('export download failed: ' + (e?.message || e)); }
     }
 
     // ── Model-thumbnail icons (Phase 1) ───────────────────────────────────────────
