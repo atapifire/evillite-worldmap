@@ -115,6 +115,7 @@ export default class WorldMapPlugin extends Plugin {
     private centerZ = 0;
     private zoom = 4;
     private followPlayer = true;
+    private followBtn: HTMLButtonElement | null = null;
     private currentFloor = 0;
 
     // ── Discovered/accumulated data ───────────────────────────────────────────────
@@ -232,7 +233,7 @@ export default class WorldMapPlugin extends Plugin {
                     this.toggleMap(true);
                     this.centerX = x;
                     this.centerZ = z;
-                    this.followPlayer = false;
+                    this.setFollow(false);
                     this.zoom = 12; // Zoom in comfortably on the target
                 });
 
@@ -760,25 +761,25 @@ export default class WorldMapPlugin extends Plugin {
         jumpBtn.title = 'Centre on the nearest search match';
         jumpBtn.onclick = () => this.jumpToNearestMatch();
 
-        const followBtn = document.createElement('button');
-        followBtn.innerText = 'Follow: ON';
-        this.styleButton(followBtn, '#2c3e50');
-        const setFollow = (on: boolean) => {
-            this.followPlayer = on;
-            followBtn.innerText = `Follow: ${on ? 'ON' : 'OFF'}`;
-        };
-        followBtn.onclick = () => setFollow(!this.followPlayer);
+        this.followBtn = document.createElement('button');
+        this.styleButton(this.followBtn, '#27ae60');
+        this.followBtn.onclick = () => this.setFollow(!this.followPlayer);
+        this.setFollow(this.followPlayer); // sync text + colour to current state
 
         const closeBtn = document.createElement('button');
-        closeBtn.innerText = 'Close';
-        this.styleButton(closeBtn, 'var(--theme-danger, #e74c3c)');
+        closeBtn.innerText = '✕';
+        this.styleButton(closeBtn, 'transparent');
+        Object.assign(closeBtn.style, { padding: '4px 9px', fontSize: '16px', lineHeight: '1', color: '#ccc' } as CSSStyleDeclaration);
+        closeBtn.title = 'Close (M)';
+        closeBtn.onmouseenter = () => { closeBtn.style.color = '#fff'; closeBtn.style.backgroundColor = 'var(--theme-danger, #e74c3c)'; };
+        closeBtn.onmouseleave = () => { closeBtn.style.color = '#ccc'; closeBtn.style.backgroundColor = 'transparent'; };
         closeBtn.onclick = () => this.toggleMap(false);
 
         const floorDownBtn = document.createElement('button');
         floorDownBtn.innerText = '▼';
         this.styleButton(floorDownBtn, '#2c3e50');
         floorDownBtn.title = 'Floor Down';
-        floorDownBtn.onclick = () => { setFollow(false); this.currentFloor--; this.worldCanvas = null; this.updateFloorLabel(); };
+        floorDownBtn.onclick = () => { this.setFollow(false); this.currentFloor--; this.worldCanvas = null; this.updateFloorLabel(); };
 
         this.floorLabelEl = document.createElement('span');
         this.updateFloorLabel();
@@ -788,11 +789,11 @@ export default class WorldMapPlugin extends Plugin {
         floorUpBtn.innerText = '▲';
         this.styleButton(floorUpBtn, '#2c3e50');
         floorUpBtn.title = 'Floor Up';
-        floorUpBtn.onclick = () => { setFollow(false); this.currentFloor++; this.worldCanvas = null; this.updateFloorLabel(); };
+        floorUpBtn.onclick = () => { this.setFollow(false); this.currentFloor++; this.worldCanvas = null; this.updateFloorLabel(); };
 
         const right = document.createElement('div');
         Object.assign(right.style, { display: 'flex', gap: '8px', alignItems: 'center' } as CSSStyleDeclaration);
-        right.append(floorDownBtn, this.floorLabelEl, floorUpBtn, followBtn, closeBtn);
+        right.append(floorDownBtn, this.floorLabelEl, floorUpBtn, this.followBtn, closeBtn);
         header.append(title, this.searchInput, jumpBtn, right);
 
         // Full-width status strip below the header (never truncated).
@@ -1044,7 +1045,7 @@ export default class WorldMapPlugin extends Plugin {
         window.addEventListener('mousemove', (e) => {
             if (dragging) {
                 const dx = e.clientX - lastX, dy = e.clientY - lastY;
-                if (Math.abs(dx) + Math.abs(dy) > 2) { moved = true; this.followPlayer = false; }
+                if (Math.abs(dx) + Math.abs(dy) > 2) { moved = true; this.setFollow(false); }
                 lastX = e.clientX; lastY = e.clientY;
                 this.centerX -= dx / this.zoom;
                 this.centerZ -= dy / this.zoom;
@@ -1067,7 +1068,7 @@ export default class WorldMapPlugin extends Plugin {
                 
                 // Also update the UI button when we stop following
                 if (this.followPlayer) {
-                    this.followPlayer = false;
+                    this.setFollow(false);
                     const btn = this.mapOverlay?.querySelector('button') as HTMLButtonElement;
                     // The follow button is one of the buttons, we should ideally use the setFollow we created, but this works:
                     const followBtn = [...(this.mapOverlay?.querySelectorAll('button') ?? [])].find(b => b.innerText.startsWith('Follow:'));
@@ -1156,7 +1157,7 @@ export default class WorldMapPlugin extends Plugin {
         if (!this.mapOverlay) return;
         if (show) {
             this.mapOverlay.style.display = 'flex';
-            this.followPlayer = true;
+            this.setFollow(true);
             this.refreshData();
             this.startRenderLoop();
         } else {
@@ -2516,6 +2517,19 @@ export default class WorldMapPlugin extends Plugin {
         this.tooltipEl.innerHTML = `<b>${hit.label}</b><br><span style="opacity:0.75">${hit.sub}</span>`;
     }
 
+    /** Single source of truth for follow state — keeps this.followPlayer and the header
+     *  button (text + colour) in sync. EVERYTHING that changes follow must call this
+     *  (drag, jump, floor change, recentre all used to set the flag directly and leave
+     *  the button showing the wrong state). */
+    private setFollow(on: boolean) {
+        this.followPlayer = on;
+        const b = this.followBtn;
+        if (!b) return;
+        b.innerText = on ? '◉ Follow' : '○ Follow';
+        b.style.backgroundColor = on ? '#27ae60' : '#3a3f44';
+        b.title = on ? 'Following you — click to free the camera' : 'Free camera — click to follow you';
+    }
+
     private jumpToNearestMatch() {
         const q = this.searchStr;
         if (!q) return;
@@ -2538,7 +2552,7 @@ export default class WorldMapPlugin extends Plugin {
         if (best) {
             this.centerX = (best as { x: number; z: number }).x;
             this.centerZ = (best as { x: number; z: number }).z;
-            this.followPlayer = false;
+            this.setFollow(false);
             this.zoom = Math.max(this.zoom, 10);
         }
     }
