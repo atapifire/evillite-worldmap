@@ -129,6 +129,10 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     this.iconPending = /* @__PURE__ */ new Set();
     this.iconQueue = [];
     this.iconRendering = false;
+    // Back-off when model fetches start returning 401/403 (the EvilQuest session token lapsed):
+    // stop hammering the server so we don't spam failures while the token refresh kicks in.
+    this.iconAuthFailStreak = 0;
+    this.iconQueuePausedUntil = 0;
     /** Representative ready icon per object category / `cat name` — drives the
      *  legend "parent" icons and the fallback for childless members. */
     this.catRepIcon = /* @__PURE__ */ new Map();
@@ -174,6 +178,10 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     }
     try {
       void this.loadShippedBundles();
+    } catch {
+    }
+    try {
+      void this.bakeStoneTexture();
     } catch {
     }
   }
@@ -2175,9 +2183,11 @@ resize();fit();})();<\/script></body></html>`;
   }
   async processIconQueue() {
     if (this.iconRendering || !this.bjs) return;
+    if (Date.now() < this.iconQueuePausedUntil) return;
     this.iconRendering = true;
     try {
       while (this.iconQueue.length) {
+        if (Date.now() < this.iconQueuePausedUntil) break;
         if (!this.bulkRendering && this.iconQueue.length > _WorldMapPlugin.MAX_ICON_QUEUE) {
           const dropped = this.iconQueue.splice(_WorldMapPlugin.MAX_ICON_QUEUE);
           for (const d of dropped) this.iconPending.delete(d.key);
@@ -2190,11 +2200,22 @@ resize();fit();})();<\/script></body></html>`;
             img.src = dataUrl;
             this.iconCache.set(key, img);
             this.iconCacheStore.save(key, dataUrl);
+            this.iconAuthFailStreak = 0;
           } else this.iconFailed.add(key);
         } catch (e) {
           this.iconFailed.add(key);
           this.lastIconDiag = `ERR ${key} ${file}: ${e?.message || e}`;
           this.sendDiag(`QUEUE-ERR ${key} ${file}: ${e?.message || e} :: ${(e?.stack || "").slice(0, 300)}`);
+          if (/\b(401|403|unauthorized|forbidden)\b/i.test(`${e?.message || e}`)) {
+            if (++this.iconAuthFailStreak >= 4) {
+              this.iconQueue.length = 0;
+              this.iconPending.clear();
+              this.iconQueuePausedUntil = Date.now() + 90 * 1e3;
+              this.sendDiag("icon queue paused 90s \u2014 model fetches returning auth errors (token likely expired)");
+              this.iconPending.delete(key);
+              break;
+            }
+          } else this.iconAuthFailStreak = 0;
         } finally {
           this.iconPending.delete(key);
         }
