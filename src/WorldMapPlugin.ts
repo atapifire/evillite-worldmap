@@ -119,6 +119,14 @@ export default class WorldMapPlugin extends Plugin {
     private mapWindowTimer: any = null;
     private mapWindowFullTimer: any = null;
     private mwCloseHooked = false;
+    // Perf: the terrain PNG (toDataURL) is a ~100ms main-thread block; cache it and only regenerate
+    // when the explored terrain actually changed. lastFullSig gates the heavy full-snapshot push so
+    // it doesn't run every 7s for no reason (which froze the game tick → click-to-move "slingshot").
+    private terrainUrl = '';
+    private terrainUrlSig = '';
+    private lastFullSig = '';
+    private mapTerrainTimer: any = null;
+    private terrainEncoding = false;
 
     // ── One viewer, two hosts ─────────────────────────────────────────────────────
     // The SAME HTML viewer (buildMapWindowHtml) runs either in a detached OS window
@@ -1336,8 +1344,16 @@ export default class WorldMapPlugin extends Plugin {
         }
         const W = this.worldW, H = this.worldH;
 
-        // Terrain as a 1px/tile PNG — the viewer scales it the same way the live map does.
-        const terrain = this.worldCanvas.toDataURL('image/png');
+        // Terrain as a 1px/tile PNG. Use the cached copy (refreshed OFF the main thread by
+        // refreshTerrainAsync via toBlob). Encode synchronously ONLY the first time, when nothing is
+        // cached yet (a one-time hit on first open) — never on the per-update path, where the
+        // blocking toDataURL would freeze the game's movement tick (the click-to-move "slingshot").
+        let terrain = this.terrainUrl;
+        if (!terrain) {
+            terrain = this.worldCanvas.toDataURL('image/png');
+            this.terrainUrl = terrain;
+            this.terrainUrlSig = this.worldW + 'x' + this.worldH + ':' + this.lastPaintedSize + ':' + this.currentFloor;
+        }
 
         // Object icons (deduped) + one representative marker per tile (mirrors drawMarkers).
         const iconIdx = new Map<string, number>();
@@ -1685,18 +1701,53 @@ export default class WorldMapPlugin extends Plugin {
             const pl = this.players.map((q) => ({ x: q.x, z: q.z, n: q.name }));
             this.pushToViewer({ p: p ? { x: p.x, z: p.z } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
         }, 280);
-        // Occasional + heavy: push a full snapshot to pick up newly explored terrain/markers.
+        // Occasional + heavy: full snapshot — but ONLY when the MARKERS change (a new object/NPC
+        // type), NOT on every explored tile. buildMapSnapshot's terrain encode + serialization is a
+        // ~100ms main-thread block; running it as you walk (explored-tile count always growing) froze
+        // the game's movement tick and snapped the player back (the click-to-move "slingshot").
         this.mapWindowFullTimer = setInterval(() => {
             if (!this.viewerOpen()) return;
             this.refreshData();
+            const sig = this.objectStore.size + ':' + this.liveEphemeral.length + ':' + this.currentFloor;
+            if (sig === this.lastFullSig) return; // markers unchanged → skip the heavy rebuild/push
+            this.lastFullSig = sig;
             const snap = this.buildMapSnapshot();
             if (snap) this.pushToViewer({ full: snap, p: snap.p });
         }, 7000);
+        // Terrain is refreshed on its own timer and encoded OFF the main thread (toBlob), so newly
+        // explored tiles appear without ever blocking the game's movement tick.
+        this.mapTerrainTimer = setInterval(() => {
+            if (!this.viewerOpen()) return;
+            this.refreshTerrainAsync();
+        }, 5000);
     }
 
     private stopMapWindowUpdates(): void {
         if (this.mapWindowTimer) { clearInterval(this.mapWindowTimer); this.mapWindowTimer = null; }
         if (this.mapWindowFullTimer) { clearInterval(this.mapWindowFullTimer); this.mapWindowFullTimer = null; }
+        if (this.mapTerrainTimer) { clearInterval(this.mapTerrainTimer); this.mapTerrainTimer = null; }
+    }
+
+    /** Re-encode the terrain PNG OFF the main thread (canvas.toBlob is async, unlike the blocking
+     *  toDataURL) and stream it to the viewer when explored tiles have changed — so the map fills in
+     *  as you walk without ever freezing the game's movement tick. */
+    private refreshTerrainAsync(): void {
+        if (this.terrainEncoding) return;
+        const cm = this.getChunkManager();
+        if (!cm || !this.rebuildWorldCanvas(cm) || !this.worldCanvas) return;
+        const sig = this.worldW + 'x' + this.worldH + ':' + this.lastPaintedSize + ':' + this.currentFloor;
+        if (sig === this.terrainUrlSig) return; // unchanged → nothing to send
+        this.terrainEncoding = true;
+        try {
+            this.worldCanvas.toBlob((blob) => {
+                this.terrainEncoding = false;
+                if (!blob) return;
+                const fr = new FileReader();
+                fr.onload = () => { this.terrainUrl = fr.result as string; this.terrainUrlSig = sig; this.pushToViewer({ terrain: this.terrainUrl }); };
+                fr.onerror = () => {};
+                fr.readAsDataURL(blob);
+            }, 'image/png');
+        } catch { this.terrainEncoding = false; }
     }
 
     /** A self-contained interactive viewer that re-renders the exported data exactly like
@@ -1933,7 +1984,7 @@ function clickAt(e){var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.
 var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);var wx=sl+mx/Z,wz=st+my/Z;
 if(best){var m=best.s.match(/(-?\\d+),(-?\\d+)/);if(m){goTo(parseInt(m[1]),parseInt(m[2]));}}
-else if(D.online){sendInput({t:"move",x:Math.round(wx),z:Math.round(wz)});}}
+else if(D.online){sendInput({t:"move",x:wx,z:wz});}}
 view.addEventListener("mousedown",function(e){if(e.button!==0)return;pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
 window.addEventListener("mouseup",function(e){if(pressed&&!dragging&&e.target&&(view===e.target||view.contains(e.target)))clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
 view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist=Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0);if((dist>DRAG_THRESH&&(Date.now()-pressT)>HOLD_MS)||dist>DRAG_THRESH*3){dragging=true;setFollow(false);view.classList.add("drag");}}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;requestRender();tip.style.display="none";}return;}
@@ -1976,6 +2027,7 @@ g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}
 function setLabel(){document.getElementById("fl").innerText="Floor "+(D.floor||0);}
 function applyUpdate(u){if(!u)return;
 if(u.full){var nd=u.full;D=nd;loadImgs();taxState();buildNpcIcon();buildCats();setLabel();dataVer++;}
+if(u.terrain){D.t=u.terrain;terrain=new Image();terrain.onload=function(){baseSig="";requestRender();};terrain.src=u.terrain;}
 if(u.p!==undefined)D.p=u.p;if(u.npc!==undefined)D.npc=u.npc;if(u.pl!==undefined)D.pl=u.pl;if(u.online!==undefined)D.online=u.online;
 if(u.dest!==undefined){var had=!!D.dest;D.dest=u.dest;if(D.dest&&!had)destT0=performance.now();}
 setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}if(u.goTo){setFollow(false);goTo(u.goTo.x,u.goTo.z);}ensureDestAnim();requestRender();}
