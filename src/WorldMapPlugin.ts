@@ -267,9 +267,13 @@ export default class WorldMapPlugin extends Plugin {
                 link.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    // Open the map (in the user's remembered host) and jump to the coordinate.
-                    this.openMap();
-                    setTimeout(() => this.pushToViewer({ goTo: { x, z } }), 60);
+                    // Open the map if it isn't already open (don't toggle a shown map shut), then
+                    // jump to the coordinate. Re-send the goTo a few times: the overlay iframe can
+                    // take >60ms to be ready on mobile, and its initial fit() would otherwise clobber
+                    // an early goTo and leave the map zoomed all the way out.
+                    if (!this.viewerOpen()) this.openMap();
+                    const go = () => this.pushToViewer({ goTo: { x, z } });
+                    setTimeout(go, 120); setTimeout(go, 450); setTimeout(go, 900);
                 });
 
                 fragment.appendChild(link);
@@ -848,7 +852,7 @@ export default class WorldMapPlugin extends Plugin {
             this.iconsEnabled = f.iconsEnabled ?? true;
             this.labelsEnabled = f.labelsEnabled ?? true;
             this.showMinimapMarkers = f.showMinimapMarkers ?? true;
-            this.mapMode = f.mapMode === 'overlay' ? 'overlay' : 'window';
+            this.mapMode = (this.isMobile || f.mapMode === 'overlay') ? 'overlay' : 'window';
         } catch { /* ignore */ }
     }
     private saveFilterState() {
@@ -1495,10 +1499,24 @@ export default class WorldMapPlugin extends Plugin {
      *  playing the game underneath). The window runs the same interactive viewer as the
      *  HTML export; the game renderer streams it live data (player position frequently, a
      *  full snapshot occasionally) over IPC. */
-    /** Entry point (sidebar icon / M-key): open the map in the user's remembered mode. */
+    /** Mobile (Capacitor WebView) has no detached OS window — the map is overlay-only there.
+     *  Set by the mobile shell (window.EvilLiteMobile); also reflected in electron.process.platform. */
+    private get isMobile(): boolean {
+        return !!(window as any).EvilLiteMobile || (window as any).electron?.process?.platform === 'android' || (window as any).electron?.process?.platform === 'ios';
+    }
+
+    /** Entry point (sidebar icon / M-key): toggle the map — open in the user's mode, or close
+     *  if it's already open (re-tap / press M again closes). */
     public openMap(): void {
-        if (this.mapMode === 'overlay') this.openOverlayHost();
+        if (this.viewerOpen()) { this.closeViewer(); return; }
+        if (this.isMobile || this.mapMode === 'overlay') this.openOverlayHost();
         else this.openWindowHost();
+    }
+
+    /** Close whichever host is open. */
+    private closeViewer(): void {
+        if (this.overlayEl) this.closeOverlayHost();
+        if (this.mapWindowOpen) { const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:close'); this.mapWindowOpen = false; }
     }
     /** Back-compat alias (chat-link handoff, older call sites). */
     public openMapWindow(): void { this.openMap(); }
@@ -1530,7 +1548,11 @@ export default class WorldMapPlugin extends Plugin {
         if (!snap) { this.warn('map: data not ready (log in / move around first)'); return; }
         const el = document.createElement('div');
         el.id = 'eq-wm-overlay';
-        Object.assign(el.style, { position: 'fixed', top: '40px', left: '40px', right: '40px', bottom: '40px', zIndex: '2147483640', boxShadow: '0 6px 28px rgba(0,0,0,.6)', border: '1px solid #333', borderRadius: '6px', overflow: 'hidden', background: '#101012' });
+        // Mobile: full-screen overlay (no inset/chrome) so the map gets the whole viewport.
+        const m = this.isMobile;
+        Object.assign(el.style, m
+            ? { position: 'fixed', inset: '0', zIndex: '2147483640', overflow: 'hidden', background: '#101012' }
+            : { position: 'fixed', top: '40px', left: '40px', right: '40px', bottom: '40px', zIndex: '2147483640', boxShadow: '0 6px 28px rgba(0,0,0,.6)', border: '1px solid #333', borderRadius: '6px', overflow: 'hidden', background: '#101012' });
         const f = document.createElement('iframe');
         Object.assign(f.style, { width: '100%', height: '100%', border: '0', display: 'block' });
         f.srcdoc = this.buildMapWindowHtml(snap, 'overlay');
@@ -1570,6 +1592,7 @@ export default class WorldMapPlugin extends Plugin {
 
     /** The ⇄ toggle: switch between window and overlay hosts, remembering the choice. */
     private switchMode(): void {
+        if (this.isMobile) return; // overlay-only on mobile — no detached OS window to switch to
         const target: 'window' | 'overlay' = this.mapMode === 'window' ? 'overlay' : 'window';
         if (this.mapMode === 'window' && this.mapWindowOpen) {
             const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:close'); this.mapWindowOpen = false;
@@ -1641,6 +1664,10 @@ export default class WorldMapPlugin extends Plugin {
             } else {
                 this.setStatus('Chat input not found.');
             }
+            // After sharing, close the map if it's the in-page OVERLAY so the chat (+ the
+            // shared link) is visible underneath — always the case on mobile. A detached
+            // WINDOW/popout doesn't block chat, so it stays open.
+            if (this.overlayEl) this.closeOverlayHost();
         }
     }
 
@@ -1728,8 +1755,8 @@ export default class WorldMapPlugin extends Plugin {
 + 'var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}'
 + 'if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});'
 + 'view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});'
-+ 'view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});'
-+ 'function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}'
++ 'view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});'
++ 'function goTo(x,z){Z=Math.max(Z,16);cx=x+0.5;cz=z+0.5;render();}'
 + 'function buildTax(){var box=document.getElementById("cats");box.innerHTML="";var esc=function(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;};'
 + 'var catIcon={},nameIcon={};D.ob.forEach(function(o){if(o.i>=0){if(catIcon[o.c]===undefined)catIcon[o.c]=o.i;if(nameIcon[o.c+"|"+o.n]===undefined)nameIcon[o.c+"|"+o.n]=o.i;}});'
 + 'var swatch=function(i,col){return i!==undefined?"<img class=ci src=\\""+D.ic[i]+"\\">":"<span class=sw style=background:"+col+"></span>";};'
@@ -1810,6 +1837,7 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 <div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan · scroll to zoom · click to walk</div><div id="loading"><div class="lspin"></div><div>Loading map…</div></div></div></div></div>
 <script>(function(){var D=${json};
 var HOST=${JSON.stringify(host)};
+var MOBILE=${this.isMobile};
 /* One viewer, two hosts: a detached BrowserWindow talks over IPC; an in-page iframe overlay
    talks over postMessage. sendInput()/applyUpdate() abstract the transport so the rest of the
    viewer is identical in both. */
@@ -1895,7 +1923,7 @@ ctx.save();ctx.lineWidth=Math.max(2,Z*0.16);ctx.strokeStyle="rgba(255,226,72,"+(
 for(var i=0;i<pingPts.length;i++){var px=(pingPts[i][0]-sl)*Z,py=(pingPts[i][1]-st)*Z;if(px<-40||px>W+40||py<-40||py>Hh+40)continue;ctx.beginPath();ctx.arc(px,py,rad,0,6.28);ctx.stroke();}
 ctx.restore();}
 function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}
-function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}
+function goTo(x,z){Z=Math.max(Z,16);cx=x+0.5;cz=z+0.5;render();}
 /* Drag-vs-click (option C): panning only engages on a deliberate drag — moved past a
    generous threshold AND held a moment (or a big fast sweep). A quick tap, even with a few
    px of drift, stays a click → walk there. Click-to-move is handled on mouseup, not the
@@ -1912,7 +1940,7 @@ view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist
 var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
 view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});
-view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
+view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
 function setFollow(on){follow=on&&!!D.online;var b=document.getElementById("follow");b.className="btn"+(D.online?"":" dis")+(follow?"":" off");b.innerText=(follow?"◉":"○")+" Follow";if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}}
 document.getElementById("follow").onclick=function(){if(!D.online)return;setFollow(!follow);};
 document.getElementById("fdown").onclick=function(){sendInput({t:"floor",f:(D.floor||0)-1});};
@@ -1955,6 +1983,37 @@ if(IPC&&IPC.on)IPC.on("map-window:update",function(e,u){applyUpdate(u);});
 window.addEventListener("message",function(e){var d=e&&e.data;if(d&&d.__wmUpdate)applyUpdate(d.__wmUpdate);});
 buildCats();setLabel();setFollow(true);ensureDestAnim();
 window.addEventListener("resize",resize);[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",requestRender);});setTimeout(render,300);setTimeout(render,1200);
+if(MOBILE){(function(){
+var ms=document.createElement("style");ms.textContent=
+"#hdr h1{display:none}#hdr{flex-wrap:wrap;gap:5px;padding:5px 8px}"
++"#q{flex:1 1 120px;font-size:15px;padding:7px 8px}#modeToggle{display:none!important}"
++".btn{padding:7px 10px;font-size:13px}#hint{display:none}#body{position:relative}"
++"#side{position:absolute;left:0;top:0;bottom:0;z-index:7;max-width:80%;overflow:auto;transform:translateX(-100%);transition:transform .2s;box-shadow:2px 0 12px rgba(0,0,0,.5)}"
++"body.side-open #side{transform:translateX(0)}"
++"#legendToggle{position:absolute;left:8px;top:8px;z-index:8;width:40px;height:40px;border:none;border-radius:8px;background:rgba(20,20,24,.85);color:#fff;font-size:20px;cursor:pointer}"
++"#zoomBtns{position:absolute;right:10px;bottom:14px;z-index:8;display:flex;flex-direction:column;gap:10px}"
++"#zoomBtns button{width:46px;height:46px;border:none;border-radius:10px;background:rgba(20,20,24,.85);color:#fff;font-size:24px;cursor:pointer}";
+document.head.appendChild(ms);
+var lt=document.createElement("button");lt.id="legendToggle";lt.textContent="\\u2630";lt.onclick=function(){document.body.classList.toggle("side-open");};view.appendChild(lt);
+var zb=document.createElement("div");zb.id="zoomBtns";var zi=document.createElement("button");zi.textContent="+";var zo=document.createElement("button");zo.textContent="\\u2212";zb.appendChild(zi);zb.appendChild(zo);view.appendChild(zb);
+function zoomBy(f){Z=clamp(Z*f,0.3,48);render();}zi.onclick=function(){zoomBy(1.4);};zo.onclick=function(){zoomBy(1/1.4);};
+var tP=false,tD=false,x0=0,y0=0,lx=0,ly=0,lp=null,pin=false,pd=0,pz=0;
+view.addEventListener("touchstart",function(e){
+ if(e.touches.length===2){pin=true;tP=false;if(lp){clearTimeout(lp);lp=null;}var a=e.touches[0],b=e.touches[1];pd=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);pz=Z;return;}
+ var t=e.touches[0];tP=true;tD=false;x0=lx=t.clientX;y0=ly=t.clientY;
+ if(lp)clearTimeout(lp);lp=setTimeout(function(){if(tP&&!tD){tP=false;view.dispatchEvent(new MouseEvent("contextmenu",{clientX:x0,clientY:y0,bubbles:true,cancelable:true}));}},500);
+},{passive:true});
+view.addEventListener("touchmove",function(e){
+ if(pin&&e.touches.length>=2){var a=e.touches[0],b=e.touches[1];var d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);if(pd>0){Z=clamp(pz*(d/pd),0.3,48);render();}e.preventDefault();return;}
+ if(!tP)return;var t=e.touches[0];var dd=Math.abs(t.clientX-x0)+Math.abs(t.clientY-y0);
+ if(!tD&&dd>12){tD=true;if(lp){clearTimeout(lp);lp=null;}setFollow(false);}
+ if(tD){cx-=(t.clientX-lx)/Z;cz-=(t.clientY-ly)/Z;lx=t.clientX;ly=t.clientY;requestRender();tip.style.display="none";e.preventDefault();}
+},{passive:false});
+view.addEventListener("touchend",function(e){if(lp){clearTimeout(lp);lp=null;}
+ if(pin){if(e.touches.length===0)pin=false;return;}
+ if(tP&&!tD){clickAt({clientX:x0,clientY:y0});}tP=false;tD=false;
+},{passive:true});
+})();}
 resize();fit();})();</script></body></html>`;
     }
 
