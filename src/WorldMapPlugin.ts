@@ -2100,6 +2100,10 @@ resize();fit();})();</script></body></html>`;
         this.bjsState = 'init';
         try {
             await this.loadPersistedIcons();
+            // Mobile: use the prebaked (APK-bundled) cache ONLY. Never spin up the offscreen Babylon
+            // engine to render icons live — a second WebGL context blanks the game's 3D view. Uncached
+            // icons fall back to coloured dots.
+            if (this.isMobile) { this.bjsState = 'failed'; this.info('icons: mobile — prebaked cache only (no live render)'); return; }
             const gm = this.gm;
             if (!gm?.scene) { this.bjsState = 'idle'; return; } // not in game yet — retry later
             let url = '';
@@ -2397,6 +2401,10 @@ resize();fit();})();</script></body></html>`;
     private static readonly HUMANOID_MODEL = '/Character models/main character.glb';
 
     private getNpcIcon(defId: number): HTMLImageElement | null {
+        // Cache-first: a prebaked npc:<defId> icon wins directly. On mobile the live model tables
+        // aren't built (no live rendering), so without this every NPC fell back to the humanoid icon.
+        const cached = this.iconFor('npc:' + defId, () => null);
+        if (cached) return cached;
         const file = this.modelFileFor('npc', defId);
         if (file) return this.iconFor('npc:' + defId, () => file);
 

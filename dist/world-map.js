@@ -1888,6 +1888,11 @@ resize();fit();})();<\/script></body></html>`;
     this.bjsState = "init";
     try {
       await this.loadPersistedIcons();
+      if (this.isMobile) {
+        this.bjsState = "failed";
+        this.info("icons: mobile \u2014 prebaked cache only (no live render)");
+        return;
+      }
       const gm = this.gm;
       if (!gm?.scene) {
         this.bjsState = "idle";
@@ -2158,6 +2163,8 @@ resize();fit();})();<\/script></body></html>`;
     return icon;
   }
   getNpcIcon(defId) {
+    const cached = this.iconFor("npc:" + defId, () => null);
+    if (cached) return cached;
     const file = this.modelFileFor("npc", defId);
     if (file) return this.iconFor("npc:" + defId, () => file);
     if (this.npcModelFiles?.has(defId)) return null;
