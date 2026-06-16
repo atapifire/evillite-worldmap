@@ -2,6 +2,7 @@
 import { Plugin } from "@evillite/core/src/interfaces/highlite/plugin/plugin.class";
 import { SettingsTypes } from "@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface";
 import { PluginAssetCache } from "@evillite/core/src/utilities/pluginAssetCache";
+import { ModelIconCache } from "@evillite/core/src/utilities/modelIconCache";
 var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
   // Bump when the render output changes (camera angle, URL fix, …) to invalidate &
   // regenerate every persisted icon. Old-version keys are purged on load.
@@ -113,9 +114,10 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     // Icons render lazily on demand, are cached, and replace the colour/shape markers.
     this.iconsEnabled = true;
     this.iconCache = /* @__PURE__ */ new Map();
-    /** Build-committed cache of rendered model icons, via the generic core asset
-     *  cache (main-process file under data/world-map-icons.json). */
-    this.iconCacheStore = new PluginAssetCache("world-map-icons");
+    /** Rendered model icons live in the CORE-managed shared 'model-icons' namespace
+     *  (data/model-icons.json) so any plugin can read them — the map is just the
+     *  producer (it can render the 3D models). See ModelIconCache. */
+    this.iconCacheStore = new ModelIconCache();
     /** Build-committed prebake of explored terrain (per map+floor), via the same core
      *  asset cache (data/world-map-terrain.json). Packaged users load a full map up
      *  front; in dev it re-bakes as you explore so the shipped cache can be updated. */

@@ -1,6 +1,7 @@
 import { Plugin } from '@evillite/core/src/interfaces/highlite/plugin/plugin.class';
 import { SettingsTypes, type PluginSettings } from '@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface';
 import { PluginAssetCache } from '@evillite/core/src/utilities/pluginAssetCache';
+import { ModelIconCache } from '@evillite/core/src/utilities/modelIconCache';
 
 /**
  * World Map plugin for EvilQuest.
@@ -1977,9 +1978,10 @@ resize();fit();})();</script></body></html>`;
     // Icons render lazily on demand, are cached, and replace the colour/shape markers.
     private iconsEnabled = true;
     private iconCache = new Map<string, HTMLImageElement>();
-    /** Build-committed cache of rendered model icons, via the generic core asset
-     *  cache (main-process file under data/world-map-icons.json). */
-    private iconCacheStore = new PluginAssetCache('world-map-icons');
+    /** Rendered model icons live in the CORE-managed shared 'model-icons' namespace
+     *  (data/model-icons.json) so any plugin can read them — the map is just the
+     *  producer (it can render the 3D models). See ModelIconCache. */
+    private iconCacheStore = new ModelIconCache();
     /** Build-committed prebake of explored terrain (per map+floor), via the same core
      *  asset cache (data/world-map-terrain.json). Packaged users load a full map up
      *  front; in dev it re-bakes as you explore so the shipped cache can be updated. */
