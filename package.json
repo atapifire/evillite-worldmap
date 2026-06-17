@@ -1,6 +1,6 @@
 {
   "name": "evillite-worldmap",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "World Map plugin for the EvilLite client — a filterable, searchable top-down map for EvilQuest built entirely from live in-game data.",
   "type": "module",
   "license": "GPL-3.0-only",
