@@ -133,8 +133,9 @@ export default class WorldMapPlugin extends Plugin {
     // ('window') or an in-page iframe docked over the game ('overlay'). mapMode is the
     // user's remembered preference; the active host is whichever is currently open.
     private mapMode: 'window' | 'overlay' = 'window';
-    private overlayEl: HTMLDivElement | null = null;   // iframe container (overlay host)
+    private overlayEl: HTMLDivElement | null = null;   // overlay host container
     private overlayFrame: HTMLIFrameElement | null = null;
+    private overlayShadow: ShadowRoot | null = null;   // shadow root the viewer runs inside
     private overlayMsgHooked = false;
 
     // ── View state (tile units) ───────────────────────────────────────────────────
@@ -1556,32 +1557,79 @@ export default class WorldMapPlugin extends Plugin {
         this.info('map opened (window).');
     }
 
-    /** Host B — in-page iframe docked over the game (postMessage transport). Same viewer. */
+    /** Host B — in-page overlay docked over the game, rendered in a SHADOW ROOT (not an iframe).
+     *
+     *  Why shadow DOM, not an iframe: the game's anti-bot input-ticket system listens for trusted
+     *  pointerdowns on the game `window` (window.addEventListener('pointerdown',_,true)) and mints an
+     *  input ticket the next command borrows. A click inside an iframe fires on the iframe's SEPARATE
+     *  window, which the game never sees — so iframe click-to-move ships with inputSeq=0 and the server
+     *  rejects it (the "slingshot"). A shadow root lives in the GAME's document: your real click is a
+     *  trusted pointerdown the game DOES register, and our synchronous move (sendInput → __wmInlineSend
+     *  → handleMapWindowInput, all in the click's call stack) rides that genuine ticket. Same CSS
+     *  isolation as the iframe, but the click is real and in-context — nothing faked. */
     private openOverlayHost(): void {
-        if (this.overlayEl) { try { this.overlayFrame?.contentWindow?.focus(); } catch { /* ignore */ } return; }
+        if (this.overlayEl) return;
         this.refreshData();
         const snap = this.buildMapSnapshot();
         if (!snap) { this.warn('map: data not ready (log in / move around first)'); return; }
+        const full = this.buildMapWindowHtml(snap, 'overlay');
+        // Split the self-contained viewer document into its <style>, body markup, and <script> IIFE.
+        const css = (full.match(/<style>([\s\S]*?)<\/style>/) || [, ''])[1];
+        const markup = (full.match(/<body>([\s\S]*?)<script>/) || [, ''])[1];
+        const script = (full.match(/<script>([\s\S]*?)<\/script><\/body>/) || [, ''])[1];
+
         const el = document.createElement('div');
         el.id = 'eq-wm-overlay';
-        // Mobile: full-screen overlay (no inset/chrome) so the map gets the whole viewport.
         const m = this.isMobile;
         Object.assign(el.style, m
             ? { position: 'fixed', inset: '0', zIndex: '2147483640', overflow: 'hidden', background: '#101012' }
             : { position: 'fixed', top: '40px', left: '40px', right: '40px', bottom: '40px', zIndex: '2147483640', boxShadow: '0 6px 28px rgba(0,0,0,.6)', border: '1px solid #333', borderRadius: '6px', overflow: 'hidden', background: '#101012' });
-        const f = document.createElement('iframe');
-        Object.assign(f.style, { width: '100%', height: '100%', border: '0', display: 'block' });
-        f.srcdoc = this.buildMapWindowHtml(snap, 'overlay');
-        el.appendChild(f);
+        const root = el.attachShadow({ mode: 'open' });
+        // The viewer assumes a <body> (base styles + `body.side-open #side` + body.classList toggles).
+        // A shadow root has no body and ShadowRoot has no classList, so wrap the markup in #wmbody
+        // and retarget that one selector. :host carries the base typography the original put on body.
+        const cssFixed = css.replace(/body\.side-open/g, '#wmbody.side-open');
+        root.innerHTML = '<style>:host{display:block;background:#101012;color:#e8e8e8;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden}'
+            + '#wmbody{height:100%;display:block}#app{height:100%!important}'
+            + cssFixed + '</style><div id="wmbody">' + markup + '</div>';
         document.body.appendChild(el);
-        this.overlayEl = el; this.overlayFrame = f;
+        this.overlayEl = el; this.overlayShadow = root; this.overlayFrame = null;
+
+        // Synchronous, in-context move dispatch so the click rides its own freshly-minted input ticket.
+        (window as any).__wmInlineSend = (msg: any) => this.handleMapWindowInput(msg);
         this.hookOverlayMessages();
-        f.addEventListener('load', () => { const s = this.buildMapSnapshot(); if (s) this.postToOverlay({ full: s, p: s.p }); });
+        // Run the viewer script with `document` scoped to the shadow root (so its getElementById/
+        // querySelector hit the overlay's own DOM, not the game's).
+        try {
+            // eslint-disable-next-line no-new-func
+            new Function('document', script)(this.makeShadowDocShim(root));
+        } catch (e) { this.warn('overlay viewer failed: ' + e); }
+        this.postToOverlay({ full: snap, p: snap.p });
         this.startMapWindowUpdates();
         this.info('map opened (overlay).');
     }
 
-    /** Receive input (click-move / floor / mode / close) posted by the overlay iframe. */
+    /** A minimal `document` shim that points element lookups at the overlay's shadow root while
+     *  leaving element creation / global event registration on the real document. */
+    private makeShadowDocShim(root: ShadowRoot): any {
+        const real = document;
+        return {
+            getElementById: (id: string) => root.getElementById(id),
+            querySelector: (s: string) => root.querySelector(s),
+            querySelectorAll: (s: string) => root.querySelectorAll(s),
+            createElement: (t: string) => real.createElement(t),
+            createElementNS: (ns: string, t: string) => real.createElementNS(ns, t),
+            createTextNode: (t: string) => real.createTextNode(t),
+            // body → the #wmbody wrapper (a real element with classList); head → the shadow root
+            // (so injected <style> stays scoped to the overlay, not leaked into the game).
+            get body() { return (root.getElementById('wmbody') || root) as any; },
+            get head() { return root as any; },
+            addEventListener: (...a: any[]) => (real.addEventListener as any)(...a),
+            removeEventListener: (...a: any[]) => (real.removeEventListener as any)(...a),
+        };
+    }
+
+    /** Receive input (click-move / floor / mode / close) from the overlay viewer. */
     private hookOverlayMessages(): void {
         if (this.overlayMsgHooked) return;
         this.overlayMsgHooked = true;
@@ -1593,17 +1641,21 @@ export default class WorldMapPlugin extends Plugin {
 
     private closeOverlayHost(): void {
         if (this.overlayEl) { try { this.overlayEl.remove(); } catch { /* ignore */ } }
-        this.overlayEl = null; this.overlayFrame = null;
+        this.overlayEl = null; this.overlayFrame = null; this.overlayShadow = null;
+        try { delete (window as any).__wmInlineSend; } catch { /* ignore */ }
         if (!this.mapWindowOpen) this.stopMapWindowUpdates();
     }
 
     private postToOverlay(payload: any): void {
+        // Shadow viewer runs in the game window — deliver data updates via a window message it
+        // already listens for. (Async is fine for data; only the MOVE must be synchronous.)
+        if (this.overlayShadow) { try { window.postMessage({ __wmUpdate: payload }, '*'); } catch { /* ignore */ } return; }
         try { this.overlayFrame?.contentWindow?.postMessage({ __wmUpdate: payload }, '*'); } catch { /* ignore */ }
     }
     /** Push a data payload to whichever host(s) are currently open. */
     private pushToViewer(payload: any): void {
         if (this.mapWindowOpen) { const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:update', payload); }
-        if (this.overlayFrame) this.postToOverlay(payload);
+        if (this.overlayShadow) this.postToOverlay(payload);
     }
 
     /** The ⇄ toggle: switch between window and overlay hosts, remembering the choice. */
@@ -1642,6 +1694,26 @@ export default class WorldMapPlugin extends Plugin {
         this.info('map window re-attached after reload.');
     }
 
+    /** Hand a click-to-move to the game — SYNCHRONOUSLY, from within the user's real click.
+     *
+     *  The slingshot was an anti-bot rejection, not a movement bug: the game stamps each command
+     *  with an inputSeq from a ticket minted by a trusted browser pointerdown the game's own
+     *  window-capture listener sees. A move with no ticket ships inputSeq=0 and the server discards
+     *  it as an inputless (bot) command → snapback. So this MUST run in the same call stack as the
+     *  real click (overlay shadow-DOM → sendInput → __wmInlineSend → here), inside the 350ms input
+     *  ticket burst, so it borrows the genuine click's ticket. Any deferral (timers, queues) fires
+     *  outside the burst → inputSeq=0 → rejected, which is why earlier attempts failed.
+     *
+     *  Only valid from the overlay: there the click is a real, in-renderer pointerdown the game
+     *  registers. The popout window is a separate renderer the game never sees, so its clicks can't
+     *  be authorized — it's view-only (faking that authorization would be defeating the anti-bot
+     *  system, which we don't do). */
+    private dispatchMapMove(worldX: number, worldZ: number): void {
+        if (!this.overlayShadow) return; // popout window = view-only (no real in-renderer click)
+        const gm = this.gm;
+        gm?.minimap?.onClickMove?.(worldX, worldZ, worldX, worldZ);
+    }
+
     /** Apply an action forwarded from the detached map window back to the live game. */
     private handleMapWindowInput(msg: any): void {
         if (!msg) return;
@@ -1652,10 +1724,17 @@ export default class WorldMapPlugin extends Plugin {
             if (player) {
                 const dx = worldX - player.x, dz = worldZ - player.z;
                 const dist = Math.sqrt(dx * dx + dz * dz);
-                const MAX = 80;
-                if (dist > MAX) { const r = MAX / dist; worldX = player.x + dx * r; worldZ = player.z + dz * r; }
+                // Clamp a far click to the game's overlay reach. The slingshot is solved (a shadow-DOM
+                // click now mints a real input ticket — see [[project_map_movement_inputticket]]), so
+                // this is no longer a desync workaround, just keeping a single click within what one
+                // move can express: the client's MAX_OVERLAY_DIST_SQ = 2025 → √ = 45 tiles, and the
+                // move packet caps at 50 path nodes (sendMove: Math.min(t.length,50)). 45 is the
+                // game's named overlay distance and sits safely under the send cap. Click again to
+                // keep walking past it.
+                const MAX_CLICK_DIST = 45; // √(GameManager MAX_OVERLAY_DIST_SQ = 2025)
+                if (dist > MAX_CLICK_DIST) { const r = MAX_CLICK_DIST / dist; worldX = player.x + dx * r; worldZ = player.z + dz * r; }
             }
-            if (this.gm?.minimap?.onClickMove) this.gm.minimap.onClickMove(worldX, worldZ, worldX, worldZ);
+            this.dispatchMapMove(worldX, worldZ);
         } else if (msg.t === 'floor') {
             const f = Math.max(0, Math.min(8, msg.f | 0));
             if (f !== this.currentFloor) {
@@ -1893,7 +1972,7 @@ var MOBILE=${this.isMobile};
    talks over postMessage. sendInput()/applyUpdate() abstract the transport so the rest of the
    viewer is identical in both. */
 var IPC=(window.electron&&window.electron.ipcRenderer)?window.electron.ipcRenderer:null;
-function sendInput(m){if(IPC){IPC.send("map-window:input",m);}else{try{parent.postMessage({__wmInput:m},"*");}catch(e){}}}
+function sendInput(m){if(window.__wmInlineSend){window.__wmInlineSend(m);return;}if(IPC){IPC.send("map-window:input",m);}else{try{parent.postMessage({__wmInput:m},"*");}catch(e){}}}
 var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");
 var terrain,ICONS,MM,ICONS_S;
 function loadImgs(){terrain=new Image();terrain.onload=function(){var l=document.getElementById("loading");if(l)l.style.display="none";baseSig="";requestRender();};terrain.src=D.t;ICONS=(D.ic||[]).map(function(s){var i=new Image();i.src=s;return i;});ICONS_S=new Array(ICONS.length);MM=(D.mm||[]).map(function(s){var i=new Image();i.src=s;return i;});}
@@ -1986,7 +2065,7 @@ var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);var wx=sl+mx/Z,wz=st+my/Z;
 if(best){var m=best.s.match(/(-?\\d+),(-?\\d+)/);if(m){goTo(parseInt(m[1]),parseInt(m[2]));}}
 else if(D.online){sendInput({t:"move",x:wx,z:wz});}}
 view.addEventListener("mousedown",function(e){if(e.button!==0)return;pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
-window.addEventListener("mouseup",function(e){if(pressed&&!dragging&&e.target&&(view===e.target||view.contains(e.target)))clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
+window.addEventListener("mouseup",function(e){var pth=(e.composedPath&&e.composedPath())||[];var onView=view===e.target||view.contains(e.target)||pth.indexOf(view)>=0;if(pressed&&!dragging&&onView)clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
 view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist=Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0);if((dist>DRAG_THRESH&&(Date.now()-pressT)>HOLD_MS)||dist>DRAG_THRESH*3){dragging=true;setFollow(false);view.classList.add("drag");}}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;requestRender();tip.style.display="none";}return;}
 var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
