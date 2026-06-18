@@ -88,6 +88,7 @@ export default class WorldMapPlugin extends Plugin {
             text: 'Open Chat Links in Popout Window',
             type: SettingsTypes.checkbox,
             value: true,
+            callback: () => {},
         },
     };
 
