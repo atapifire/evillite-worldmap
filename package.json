@@ -16,8 +16,12 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@evillite/core": "^0.1.2",
+    "@evillite/core": "file:./evillite-core.tgz",
     "esbuild": "^0.25.0",
     "typescript": "^5.4.0"
+  },
+  "packageManager": "yarn@4.9.1",
+  "engines": {
+    "node": "22.x"
   }
 }
