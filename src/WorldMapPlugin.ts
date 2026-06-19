@@ -88,7 +88,6 @@ export default class WorldMapPlugin extends Plugin {
             text: 'Open Chat Links in Popout Window',
             type: SettingsTypes.checkbox,
             value: true,
-            callback: () => {},
         },
     };
 
@@ -125,6 +124,10 @@ export default class WorldMapPlugin extends Plugin {
     // it doesn't run every 7s for no reason (which froze the game tick → click-to-move "slingshot").
     private terrainUrl = '';
     private terrainUrlSig = '';
+    // Set whenever the worldCanvas is repainted, so the viewer's terrain is re-encoded + re-sent.
+    // (The old size-based signature never changed — tilePaintedEntries is a fixed-size sliding
+    // window — so the viewer's terrain froze at its first encode and never picked up new detail.)
+    private terrainDirty = true;
     private lastFullSig = '';
     private mapTerrainTimer: any = null;
     private terrainEncoding = false;
@@ -324,6 +327,7 @@ export default class WorldMapPlugin extends Plugin {
             await this.initIconSystem();   // load prebaked icon cache + Babylon -> bjsState ready
             void this.renderAllIcons();    // bulk preload all icons in the background
             this.refreshData();            // populate objectStore / markers / NPCs (queues icon renders)
+            void this.loadWorldMapApi();   // sanctioned server map API: authoritative NPC spawn points
             this.rebuildWorldCanvas(cm);   // build terrain + walls
             setTimeout(() => this.refreshData(), 1500); // settle pass for late-streaming defs
             // If a detached window was re-attached after an AFK reload, push live data now so
@@ -1069,7 +1073,7 @@ export default class WorldMapPlugin extends Plugin {
         if (token !== this.worldSeedToken) return;
         const ls = this.loadOfflineBundle();
         if (matches(ls)) layers.push(ls);
-        if (!layers.length) return;
+        if (!layers.length) { this.applyApiTerrain(); return; }
 
         const tmp = document.createElement('canvas');
         tmp.width = mapW; tmp.height = mapH;
@@ -1089,12 +1093,16 @@ export default class WorldMapPlugin extends Plugin {
                 }
             }
         }
-        if (!drewTerrain || token !== this.worldSeedToken || !this.worldCtx) return;
-        const ctx = this.worldCtx;
-        ctx.save();
-        ctx.globalCompositeOperation = 'destination-over';
-        ctx.drawImage(tmp, 0, 0);
-        ctx.restore();
+        if (token !== this.worldSeedToken || !this.worldCtx) return;
+        if (drewTerrain) {
+            const ctx = this.worldCtx;
+            ctx.save();
+            ctx.globalCompositeOperation = 'destination-over';
+            ctx.drawImage(tmp, 0, 0);
+            ctx.restore();
+            this.terrainDirty = true;
+        }
+        this.applyApiTerrain();   // fill any tiles the cache seed didn't cover with the server terrain
     }
 
     private rebuildWorldCanvas(cm: any): boolean {
@@ -1268,6 +1276,7 @@ export default class WorldMapPlugin extends Plugin {
         if (!tctx) return false;
         tctx.putImageData(img, 0, 0);
         ctx.drawImage(tmp, startX, startZ);
+        this.terrainDirty = true; // canvas repainted → viewer needs a fresh terrain encode
         return true;
     }
 
@@ -1301,35 +1310,145 @@ export default class WorldMapPlugin extends Plugin {
             return false;
         };
 
-        // Seed `placed` with live NPCs so historical clusters near them are suppressed.
+        // Live NPC positions on this floor. Seed `placed` (for the last-known fallback's clustering)
+        // and keep a flat list to suppress a spawn marker only when that exact NPC is in view on it.
+        const liveHere: { defId: number; x: number; z: number }[] = [];
         for (const n of this.liveNpcs) {
             if ((n.floor ?? 0) === floor && !nameOff(n.name)) {
+                liveHere.push({ defId: n.defId, x: n.x, z: n.z });
                 let arr = placed.get(n.defId); if (!arr) { arr = []; placed.set(n.defId, arr); } arr.push({ x: n.x, z: n.z });
             }
         }
+        const liveCovers = (defId: number, x: number, z: number) => {
+            for (const l of liveHere) { if (l.defId !== defId) continue; const dx = l.x - x, dz = l.z - z; if (dx * dx + dz * dz <= 36) return true; }
+            return false;
+        };
 
-        // 1) Exact last-known per session NPC instance. We ALWAYS draw this (even if it's currently 
-        //    live) so that the faded Stored marker sits exactly beneath the bright Live marker.
-        //    When the live NPC walks out of range and vanishes, the Stored marker is already 
-        //    pre-loaded underneath it, preventing any flashing or out-of-order rendering.
-        for (const s of this.sessionNpcs.values()) {
-            if ((s.floor ?? 0) !== floor || nameOff(s.name)) continue;
-            place(s.defId, s.x, s.z, s.name, s.level ?? 0);
+        // 1) Default NPC positions = authoritative spawn points from EvilQuest's /api/world-map (see
+        //    loadWorldMapApi), shown everywhere — even unexplored. EACH spawn is a distinct location:
+        //    we do NOT merge spawns of the same type (two Black Bears ~8 tiles apart are two spawns).
+        //    A spawn is hidden only if that NPC is LIVE right on it (≤6t) — then it shows at its live
+        //    position. Replaces the old last-known accumulation as the position source.
+        const spawnDefIds = new Set<number>();
+        for (const s of this.apiSpawns) {
+            spawnDefIds.add(s.npcId);
+            if ((s.floor ?? 0) !== floor || nameOff(s.name) || liveCovers(s.npcId, s.x, s.z)) continue;
+            out.push({ x: s.x, z: s.z, n: this.prettify(s.name), l: 0, i: iconIdxOf(s.npcId) });
         }
 
-        // 2) Cross-session persisted clusters for NPCs not seen (here) this session — fills in
-        //    spawns from prior sessions / offline. Cluster each def's tiles, newest tile wins.
+        // 2) Last-known sightings — ONLY for NPC types the API doesn't list (event/quest NPCs), or
+        //    as the full fallback before the API has loaded / offline (then spawnDefIds is empty).
+        for (const s of this.sessionNpcs.values()) {
+            if ((s.floor ?? 0) !== floor || nameOff(s.name) || spawnDefIds.has(s.defId)) continue;
+            if (!covered(s.defId, s.x, s.z)) place(s.defId, s.x, s.z, s.name, s.level ?? 0);
+        }
         for (const [defId, m] of this.npcStore) {
+            if (spawnDefIds.has(defId)) continue;
             const name = (m.values().next().value?.name) ?? `NPC #${defId}`;
             if (nameOff(name)) continue;
             const pts = [...m.values()].filter((s) => (s.floor ?? 0) === floor).sort((a, b) => (b.seen ?? 0) - (a.seen ?? 0));
-            for (const s of pts) { 
-                if (!covered(defId, s.x, s.z)) {
-                    place(defId, s.x, s.z, name, s.level ?? 0); 
-                }
-            }
+            for (const s of pts) if (!covered(defId, s.x, s.z)) place(defId, s.x, s.z, name, s.level ?? 0);
         }
         return out;
+    }
+
+    // ── EvilQuest server world-map API (sanctioned static map data) ───────────────────────────
+    /** Default NPC spawn points pulled from /api/world-map (authoritative + complete, not gated on
+     *  exploration). Terrain from the same endpoint is handled separately. */
+    private apiSpawns: { x: number; z: number; floor: number; npcId: number; name: string }[] = [];
+    private apiTileRows: string[] | null = null;   // full server terrain grid (floor 0): 1 char/tile
+    private apiMapLoaded = false;
+    /** src -> index map from the last full snapshot's icon array, so the frequent live-NPC stream
+     *  (which doesn't resend the icon array) can reference the icons the viewer already holds. */
+    private lastIconIdx: Map<string, number> | null = null;
+
+    /**
+     * Pull static map data from EvilQuest's own server endpoint (`/api/world-map`). It is the
+     * authoritative, complete map (not exploration-gated). We fetch it at most once per ~12h,
+     * cached in localStorage; we never poll. This is the cooperative data path (their published
+     * endpoint), not gm scraping, and the map works fully without it (gm fallback).
+     *
+     * ⚠️ PRE-SHIP: confirm with the EvilQuest devs (via Oni) that programmatic client use of this
+     * endpoint is sanctioned before shipping. If it isn't, gate or remove this — nothing else
+     * depends on it.
+     */
+    private async loadWorldMapApi(): Promise<void> {
+        if (this.apiMapLoaded) return;
+        this.apiMapLoaded = true;
+        const cacheKey = `eq_wm_api:${this.mapId || 'world'}`;
+        // Serve the cached subset immediately; only re-pull the 798KB payload if it's stale (>12h).
+        try {
+            const cached = localStorage.getItem(cacheKey);
+            if (cached) {
+                const c = JSON.parse(cached);
+                if (Array.isArray(c.spawns)) this.apiSpawns = c.spawns;
+                if (Array.isArray(c.rows)) this.apiTileRows = c.rows;
+                if (Array.isArray(c.spawns) || Array.isArray(c.rows)) this.afterApiLoad();
+                // Only skip the refetch if the cache is fresh AND complete (older caches lack rows).
+                if (c.fetchedAt && Date.now() - c.fetchedAt < 12 * 3600 * 1000 && Array.isArray(c.rows)) return;
+            }
+        } catch { /* ignore bad cache */ }
+        try {
+            const res = await fetch('https://evilquest.net/api/world-map', { credentials: 'same-origin' });
+            if (!res.ok) return;
+            const m = (await res.json())?.map;
+            if (!m || !Array.isArray(m.npcSpawns)) return;
+            this.apiSpawns = m.npcSpawns.map((s: any) => ({ x: +s.x, z: +s.z, floor: s.floor | 0, npcId: s.npcId | 0, name: (s.name ?? '') + '' }));
+            if (Array.isArray(m.tileRows)) this.apiTileRows = m.tileRows;
+            try { localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), updatedAt: m.updatedAt, spawns: this.apiSpawns, rows: this.apiTileRows })); } catch { /* quota */ }
+            this.afterApiLoad();
+        } catch { /* offline / blocked — gm data still works */ }
+    }
+
+    /** Re-render whatever viewer is open once async API data lands. */
+    private afterApiLoad(): void {
+        try {
+            this.applyApiTerrain();   // fill the full map base from the server terrain grid
+            const s = this.buildMapSnapshot();
+            if (s) this.pushToViewer({ full: s, p: s.p });
+        } catch { /* not in-world yet */ }
+    }
+
+    // Server tileRows char -> colour. Matches the game's base tile palette (see TYPE_COLOR);
+    // p=path uses the textured colour, m=mud a muted swamp green.
+    private static readonly TILE_CHAR_COLOR: Record<string, number[]> = {
+        g: [62, 140, 46], d: [138, 104, 60], p: [138, 116, 82], s: [196, 170, 106],
+        r: [130, 124, 114], w: [44, 88, 142], m: [78, 110, 52],
+    };
+
+    /** Paint the authoritative full-map terrain (API `tileRows`) into the worldCanvas, filling every
+     *  tile the live/seed paint hasn't already covered (destination-over, so explored detail stays on
+     *  top). This makes the WHOLE map show in colour on login — no exploration needed — and the live
+     *  gm rebuild keeps adding finer detail (lighting/biome) on loaded tiles. Floor 0 only. */
+    private applyApiTerrain(): void {
+        const rows = this.apiTileRows, cv = this.worldCanvas, ctx = this.worldCtx;
+        if (!rows || !cv || !ctx || this.currentFloor !== 0 || rows.length < cv.height) return;
+        const W = cv.width, H = cv.height;
+        const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
+        const tctx = tmp.getContext('2d'); if (!tctx) return;
+        const img = tctx.createImageData(W, H); const d = img.data;
+        const CC = WorldMapPlugin.TILE_CHAR_COLOR;
+        const cl = (v: number) => v < 0 ? 0 : v > 255 ? 255 : v | 0;
+        for (let z = 0; z < H; z++) {
+            const row = rows[z]; if (!row) continue;
+            for (let x = 0; x < W && x < row.length; x++) {
+                const ch = row[x], c = CC[ch]; if (!c) continue;
+                const o = (z * W + x) * 4;
+                // Same coordinate noise the gm minimap render uses, so the API fill reads as textured
+                // terrain rather than a flat block (water gets the smaller-amplitude variant).
+                if (ch === 'w') {
+                    const n = ((((x * 3 * 73856093) ^ (z * 7 * 19349663)) & 255) / 255) * 6 - 3;
+                    d[o] = cl(c[0] + n * 0.5); d[o + 1] = cl(c[1] + n * 0.3); d[o + 2] = cl(c[2] + n * 0.2);
+                } else {
+                    const n = ((((x * 73856093) ^ (z * 19349663)) & 255) / 255) * 6 - 3;
+                    d[o] = cl(c[0] + n); d[o + 1] = cl(c[1] + n); d[o + 2] = cl(c[2] + n);
+                }
+                d[o + 3] = 255;
+            }
+        }
+        tctx.putImageData(img, 0, 0);
+        ctx.save(); ctx.globalCompositeOperation = 'destination-over'; ctx.drawImage(tmp, 0, 0); ctx.restore();
+        this.terrainUrl = ''; this.terrainDirty = true; // force the viewer to receive the filled terrain
     }
 
     /** Gather a full, self-contained snapshot of the explored map (terrain PNG + deduped
@@ -1411,6 +1530,8 @@ export default class WorldMapPlugin extends Plugin {
         // Cached "last-known" NPC positions (one per spawn cluster) so the window/offline
         // view can show NPCs when not live — the Off/Stored/Live switch keys off this + npc.
         const ns = this.buildNpcSightings(this.currentFloor, (d) => idxOf(this.getNpcIcon(d)));
+        // Remember this snapshot's icon indexing so the frequent live stream can reuse it.
+        this.lastIconIdx = iconIdx;
 
         // Sparse wall list [x,z,wf,...] (wf = N|E|S|W bitmask) so the viewer can draw the
         // vanilla white wall lines at screen scale, exactly like the in-game minimap.
@@ -1777,7 +1898,13 @@ export default class WorldMapPlugin extends Plugin {
             this.refreshData();
             const p = this.getPlayerPos();
             // Player position + live entities stream frequently so the viewer feels live.
-            const npc = this.liveNpcs.filter((n) => (n.floor ?? 0) === this.currentFloor).map((n) => ({ x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0 }));
+            const npc = this.liveNpcs.filter((n) => (n.floor ?? 0) === this.currentFloor).map((n) => {
+                // Resolve the icon into the array the viewer already holds (from the last full
+                // snapshot) so live NPCs keep their model icon between full snapshots, not a dot.
+                const im = this.getNpcIcon(n.defId);
+                const i = (im && im.complete && im.naturalWidth && im.src.startsWith('data:') && this.lastIconIdx) ? (this.lastIconIdx.get(im.src) ?? -1) : -1;
+                return { x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0, i };
+            });
             const pl = this.players.map((q) => ({ x: q.x, z: q.z, n: q.name }));
             this.pushToViewer({ p: p ? { x: p.x, z: p.z } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
         }, 280);
@@ -1815,19 +1942,19 @@ export default class WorldMapPlugin extends Plugin {
         if (this.terrainEncoding) return;
         const cm = this.getChunkManager();
         if (!cm || !this.rebuildWorldCanvas(cm) || !this.worldCanvas) return;
-        const sig = this.worldW + 'x' + this.worldH + ':' + this.lastPaintedSize + ':' + this.currentFloor;
-        if (sig === this.terrainUrlSig) return; // unchanged → nothing to send
+        if (!this.terrainDirty) return; // canvas unchanged since last encode → nothing to send
+        this.terrainDirty = false;
         this.terrainEncoding = true;
         try {
             this.worldCanvas.toBlob((blob) => {
                 this.terrainEncoding = false;
                 if (!blob) return;
                 const fr = new FileReader();
-                fr.onload = () => { this.terrainUrl = fr.result as string; this.terrainUrlSig = sig; this.pushToViewer({ terrain: this.terrainUrl }); };
+                fr.onload = () => { this.terrainUrl = fr.result as string; this.pushToViewer({ terrain: this.terrainUrl }); };
                 fr.onerror = () => {};
                 fr.readAsDataURL(blob);
             }, 'image/png');
-        } catch { this.terrainEncoding = false; }
+        } catch { this.terrainEncoding = false; this.terrainDirty = true; }
     }
 
     /** A self-contained interactive viewer that re-renders the exported data exactly like
@@ -2023,7 +2150,7 @@ function drawNpc(N,alpha,tag){var nx=(N.x-sl)*Z,ny=(N.z-st)*Z;if(nx<-20||nx>W+20
 var nii=(N.i!==undefined&&N.i>=0)?N.i:(npcIcon[N.n]!==undefined?npcIcon[N.n]:-1);var nsc=nii>=0?shadowed(nii):null;var nhr;ctx.globalAlpha=alpha;
 if(nsc){var nim=ICONS[nii];var nsz=clamp(Z*2.6,20,44);var nk=nsz/nim.naturalWidth,ndw=nsc.width*nk,ndh=nsc.height*nk;ctx.drawImage(nsc,nx-ndw/2,ny-ndh/2,ndw,ndh);nhr=nsz/2;}
 else{ctx.fillStyle=tag==="live"?"#f1c40f":"#9aa0a6";ctx.strokeStyle="rgba(0,0,0,.6)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(nx,ny,4,0,6.28);ctx.fill();ctx.stroke();nhr=5;}
-ctx.globalAlpha=1;hits.push({sx:nx,sy:ny,r:nhr,n:N.n+(N.l?" (lv "+N.l+")":"")+(tag==="stored"?" · last seen":""),s:"NPC - "+N.x+","+N.z});}
+ctx.globalAlpha=1;hits.push({sx:nx,sy:ny,r:nhr,n:N.n+(N.l?" (lv "+N.l+")":"")+(tag==="stored"?" · spawn":""),s:"NPC - "+N.x+","+N.z});}
 if(npcMode>0){
 if(npcMode===1){var SN=D.ns||[];for(var si=0;si<SN.length;si++)drawNpc(SN[si],0.85,"stored");}
 else{var LV=D.npc||[],SN2=D.ns||[];
@@ -2517,6 +2644,14 @@ resize();fit();})();</script></body></html>`;
                     if (this.commonPrefix(arr).length >= 4) assetId = arr[0];
                 }
             }
+        }
+        // Still nothing — the placed mesh isn't loaded near us (e.g. a distant fishing spot), so it
+        // has no runtime assetId. Fall back to the def's declared model identity: fishing spots carry
+        // a stable modelAssetId (e.g. FishingSpotBubblesCrayfish) that resolves via the asset registry
+        // / icon bake, so the icon shows even before the object's own mesh streams in.
+        if (!assetId) {
+            const mAsset = this.gm?.objectDefsCache?.get(o.defId)?.modelAssetId;
+            if (typeof mAsset === 'string' && mAsset) assetId = mAsset;
         }
         const key = assetId ? 'obj:' + assetId : 'objdef:' + o.defId;
         const icon = this.iconFor(key, () => this.objAssetFile(assetId) ?? this.objModelFiles?.get(o.defId) ?? null);
