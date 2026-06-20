@@ -1,10 +1,11 @@
 {
   "name": "evillite-worldmap",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "World Map plugin for the EvilLite client — a filterable, searchable top-down map for EvilQuest built entirely from live in-game data.",
   "type": "module",
   "license": "GPL-3.0-only",
   "author": "atapifire",
+  "main": "src/WorldMapPlugin.ts",
   "evillite": {
     "id": "world-map",
     "displayName": "World Map",
@@ -12,7 +13,7 @@
     "minClientVersion": "0.2.0"
   },
   "scripts": {
-    "build": "esbuild src/WorldMapPlugin.ts --bundle --format=esm --platform=browser --target=es2020 --external:@evillite/core --external:@babylonjs/* --outfile=dist/world-map.js",
+    "build": "node build.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

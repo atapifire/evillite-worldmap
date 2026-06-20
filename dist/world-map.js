@@ -1,4 +1,4 @@
-// ../evillite-worldmap/src/WorldMapPlugin.ts
+// src/WorldMapPlugin.ts
 import { Plugin } from "@evillite/core/src/interfaces/highlite/plugin/plugin.class";
 import { SettingsTypes } from "@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface";
 import { PluginAssetCache } from "@evillite/core/src/utilities/pluginAssetCache";
@@ -36,6 +36,13 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     this.worldW = 0;
     this.worldH = 0;
     this.worldWalls = new Uint8Array(0);
+    // Per-tile terrain colour, 0=unpainted else (0xFF<<24)|(r<<16)|(g<<8)|b. The SOURCE OF TRUTH for
+    // terrain: it only ever accumulates real rendered tiles (like worldWalls), is what we persist,
+    // and never erodes. The canvas + API fill are just a render of it. Avoids the old raster-snapshot
+    // erosion (a flat frame, the seed/API race, or the downgrade guard degrading the saved map).
+    this.worldTerrain = new Uint32Array(0);
+    this.terrainSeeded = false;
+    // true once worldTerrain has been restored from cache (or there's none) — gates persist so a partial pre-seed map can't overwrite a full saved one
     // Invalidates in-flight async terrain seeds when the canvas is recreated (floor/size change).
     this.worldSeedToken = 0;
     // Throttle for re-baking the shipped terrain cache in dev (ms timestamp).
@@ -54,6 +61,10 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     // it doesn't run every 7s for no reason (which froze the game tick → click-to-move "slingshot").
     this.terrainUrl = "";
     this.terrainUrlSig = "";
+    // Set whenever the worldCanvas is repainted, so the viewer's terrain is re-encoded + re-sent.
+    // (The old size-based signature never changed — tilePaintedEntries is a fixed-size sliding
+    // window — so the viewer's terrain froze at its first encode and never picked up new detail.)
+    this.terrainDirty = true;
     this.lastFullSig = "";
     this.mapTerrainTimer = null;
     this.terrainEncoding = false;
@@ -100,6 +111,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     this.labelsEnabled = true;
     this.showMinimapMarkers = true;
     this.warmedUp = false;
+    this.lastPlayerAngle = null;
     this._mmDumped = false;
     // One-time import of pre-plugin.data localStorage (`evilitemap:*`). Best-effort:
     // the old launch-time clearStorageData() wiped this each boot, so there's at most
@@ -116,6 +128,16 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     // Wall-edge line color — RGB(220,216,200): warm cream, same as game minimap white lines.
     this.lastPaintedSize = -1;
     this.lastRebuild = 0;
+    // ── EvilQuest server world-map API (sanctioned static map data) ───────────────────────────
+    /** Default NPC spawn points pulled from /api/world-map (authoritative + complete, not gated on
+     *  exploration). Terrain from the same endpoint is handled separately. */
+    this.apiSpawns = [];
+    this.apiTileRows = null;
+    // full server terrain grid (floor 0): 1 char/tile
+    this.apiMapLoaded = false;
+    /** src -> index map from the last full snapshot's icon array, so the frequent live-NPC stream
+     *  (which doesn't resend the icon array) can reference the icons the viewer already holds. */
+    this.lastIconIdx = null;
     // ── Model-thumbnail icons (Phase 1) ───────────────────────────────────────────
     // Render the game's own 3D models to small sprites by reusing its already-loaded
     // Babylon instance (dynamically imported from the page's babylon-core module).
@@ -300,6 +322,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
       await this.initIconSystem();
       void this.renderAllIcons();
       this.refreshData();
+      void this.loadWorldMapApi();
       this.rebuildWorldCanvas(cm);
       setTimeout(() => this.refreshData(), 1500);
       if (this.mapWindowOpen) {
@@ -375,6 +398,22 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     if (lp?.position) return { x: lp.position.x, z: lp.position.z };
     return null;
   }
+  /** The player's facing angle for our NORTH-UP world map. We piggyback the vanilla minimap's
+   *  already-smoothed arrow angle (mm.playerArrowAngle — it runs the game's smoothPlayerArrowAngle
+   *  rate-limiter and tracks the heading exactly) and convert it from the minimap's CAMERA-ROTATED
+   *  frame into our north-up frame by adding (alpha − π/2). Verified empirically: across all stable
+   *  samples our north-up angle == mm.playerArrowAngle + mm.lastAlpha − π/2. This makes our arrow
+   *  glide and face identically to the in-game minimap arrow, and the (+alpha) term cancels camera
+   *  rotation so it stays north-up. (The old approach derived atan2(headingDx,−headingDz) behind a
+   *  0.0009 speed threshold that rejected straight N/S/E/W movement → stale/wrong-facing arrow.)
+   *  null until the game has computed an arrow angle (first move). */
+  getPlayerAngle() {
+    const mm = this.gm?.minimap;
+    if (!mm || !mm.hasPlayerArrowAngle) return this.lastPlayerAngle;
+    const a = mm.playerArrowAngle + (mm.lastAlpha || 0) - Math.PI / 2;
+    this.lastPlayerAngle = Math.atan2(Math.sin(a), Math.cos(a));
+    return this.lastPlayerAngle;
+  }
   catColor(cat) {
     const known = _WorldMapPlugin.CAT_COLOR[cat];
     if (known) return known;
@@ -411,9 +450,9 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     const cm = this.getChunkManager();
     const live = !!(cm && cm.mapWidth | 0 && (cm.tilePaintedEntries?.size | 0) > 0) && !!this.getPlayerPos();
     if (live && !this.wasOnline) {
-      this.worldCanvas = null;
       this.lastPaintedSize = -1;
       this.lastRebuild = 0;
+      if (this.worldCanvas) void this.seedWorldFromCaches(this.worldW, this.worldH, this.currentFloor);
     }
     this.wasOnline = live;
   }
@@ -924,7 +963,11 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     if (token !== this.worldSeedToken) return;
     const ls = this.loadOfflineBundle();
     if (matches(ls)) layers.push(ls);
-    if (!layers.length) return;
+    if (!layers.length) {
+      this.terrainSeeded = true;
+      this.applyApiTerrain();
+      return;
+    }
     const tmp = document.createElement("canvas");
     tmp.width = mapW;
     tmp.height = mapH;
@@ -951,12 +994,21 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
         }
       }
     }
-    if (!drewTerrain || token !== this.worldSeedToken || !this.worldCtx) return;
-    const ctx = this.worldCtx;
-    ctx.save();
-    ctx.globalCompositeOperation = "destination-over";
-    ctx.drawImage(tmp, 0, 0);
-    ctx.restore();
+    if (token !== this.worldSeedToken || !this.worldCtx) return;
+    if (drewTerrain) {
+      const ctx = this.worldCtx;
+      ctx.save();
+      ctx.globalCompositeOperation = "destination-over";
+      ctx.drawImage(tmp, 0, 0);
+      ctx.restore();
+      try {
+        this.restoreWorldTerrain(tctx.getImageData(0, 0, mapW, mapH).data);
+      } catch {
+      }
+      this.terrainDirty = true;
+    }
+    this.terrainSeeded = true;
+    this.applyApiTerrain();
   }
   rebuildWorldCanvas(cm) {
     const mapW = cm.mapWidth | 0;
@@ -969,10 +1021,14 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
       this.worldW = mapW;
       this.worldH = mapH;
       this.worldWalls = new Uint8Array(mapW * mapH);
+      this.worldTerrain = new Uint32Array(mapW * mapH);
+      this.terrainSeeded = false;
       this.worldCtx = this.worldCanvas.getContext("2d", { willReadFrequently: true });
       this.lastPaintedSize = -1;
       void this.seedWorldFromCaches(mapW, mapH, this.currentFloor);
     }
+    const liveNow = (cm.tilePaintedEntries?.size | 0) > 0 && !!this.getPlayerPos();
+    if (!liveNow) return !!this.worldCanvas;
     const painted = cm.tilePaintedEntries?.size ?? 0;
     const now = performance.now();
     const grew = painted !== this.lastPaintedSize;
@@ -981,18 +1037,10 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     if (haveMap && !grew && now - this.lastRebuild < 1500) return true;
     this.lastPaintedSize = painted;
     this.lastRebuild = now;
-    const RADIUS_CAP = 768;
-    const fullRadius = Math.ceil(Math.max(mapW, mapH) / 2) + 2;
-    const radius = Math.min(fullRadius, RADIUS_CAP);
-    let cx, cz;
-    if (radius >= fullRadius) {
-      cx = mapW / 2;
-      cz = mapH / 2;
-    } else {
-      const p = this.getPlayerPos();
-      cx = p ? p.x : mapW / 2;
-      cz = p ? p.z : mapH / 2;
-    }
+    const p = this.getPlayerPos();
+    if (!p) return !!this.worldCanvas;
+    const radius = 24;
+    const cx = p.x, cz = p.z;
     let buf;
     try {
       buf = this.getTilesForFloor(cm, cx, cz, radius, this.currentFloor);
@@ -1087,6 +1135,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
         data[o + 1] = g;
         data[o + 2] = bl;
         data[o + 3] = 255;
+        this.worldTerrain[worldZ * mapW + worldX] = 4278190080 | r << 16 | g << 8 | bl;
       }
     }
     for (let f = 0; f < size; f++) {
@@ -1097,9 +1146,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
         if (voidTiles[b]) continue;
         const wf = walls[b];
         const type = tiles[b];
-        if (!wf || type === T.WALL || (wf & 5) === 5 || (wf & 10) === 10) {
-          this.worldWalls[worldZ * mapW + worldX] = 0;
-        } else {
+        if (wf && type !== T.WALL && (wf & 5) !== 5 && (wf & 10) !== 10) {
           this.worldWalls[worldZ * mapW + worldX] = wf;
         }
       }
@@ -1111,6 +1158,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     if (!tctx) return false;
     tctx.putImageData(img, 0, 0);
     ctx.drawImage(tmp, startX, startZ);
+    this.terrainDirty = true;
     return true;
   }
   // ── Map export (for the wiki: standalone interactive HTML the Hub can host + iframe) ─
@@ -1148,8 +1196,10 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
       }
       return false;
     };
+    const liveHere = [];
     for (const n of this.liveNpcs) {
       if ((n.floor ?? 0) === floor && !nameOff(n.name)) {
+        liveHere.push({ defId: n.defId, x: n.x, z: n.z });
         let arr = placed.get(n.defId);
         if (!arr) {
           arr = [];
@@ -1158,21 +1208,127 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
         arr.push({ x: n.x, z: n.z });
       }
     }
+    const liveCovers = (defId, x, z) => {
+      for (const l of liveHere) {
+        if (l.defId !== defId) continue;
+        const dx = l.x - x, dz = l.z - z;
+        if (dx * dx + dz * dz <= 36) return true;
+      }
+      return false;
+    };
+    const spawnDefIds = /* @__PURE__ */ new Set();
+    for (const s of this.apiSpawns) {
+      spawnDefIds.add(s.npcId);
+      if ((s.floor ?? 0) !== floor || nameOff(s.name) || liveCovers(s.npcId, s.x, s.z)) continue;
+      out.push({ x: s.x, z: s.z, n: this.prettify(s.name), l: 0, i: iconIdxOf(s.npcId) });
+    }
     for (const s of this.sessionNpcs.values()) {
-      if ((s.floor ?? 0) !== floor || nameOff(s.name)) continue;
-      place(s.defId, s.x, s.z, s.name, s.level ?? 0);
+      if ((s.floor ?? 0) !== floor || nameOff(s.name) || spawnDefIds.has(s.defId)) continue;
+      if (!covered(s.defId, s.x, s.z)) place(s.defId, s.x, s.z, s.name, s.level ?? 0);
     }
     for (const [defId, m] of this.npcStore) {
+      if (spawnDefIds.has(defId)) continue;
       const name = m.values().next().value?.name ?? `NPC #${defId}`;
       if (nameOff(name)) continue;
       const pts = [...m.values()].filter((s) => (s.floor ?? 0) === floor).sort((a, b) => (b.seen ?? 0) - (a.seen ?? 0));
-      for (const s of pts) {
-        if (!covered(defId, s.x, s.z)) {
-          place(defId, s.x, s.z, name, s.level ?? 0);
-        }
-      }
+      for (const s of pts) if (!covered(defId, s.x, s.z)) place(defId, s.x, s.z, name, s.level ?? 0);
     }
     return out;
+  }
+  /**
+   * Pull static map data from EvilQuest's own server endpoint (`/api/world-map`). It is the
+   * authoritative, complete map (not exploration-gated). We fetch it at most once per ~12h,
+   * cached in localStorage; we never poll. This is the cooperative data path (their published
+   * endpoint), not gm scraping, and the map works fully without it (gm fallback).
+   *
+   * ⚠️ PRE-SHIP: confirm with the EvilQuest devs (via Oni) that programmatic client use of this
+   * endpoint is sanctioned before shipping. If it isn't, gate or remove this — nothing else
+   * depends on it.
+   */
+  async loadWorldMapApi() {
+    if (this.apiMapLoaded) return;
+    this.apiMapLoaded = true;
+    const cacheKey = `eq_wm_api:${this.mapId || "world"}`;
+    try {
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        const c = JSON.parse(cached);
+        if (Array.isArray(c.spawns)) this.apiSpawns = c.spawns;
+        if (Array.isArray(c.rows)) this.apiTileRows = c.rows;
+        if (Array.isArray(c.spawns) || Array.isArray(c.rows)) this.afterApiLoad();
+        if (c.fetchedAt && Date.now() - c.fetchedAt < 12 * 3600 * 1e3 && Array.isArray(c.rows)) return;
+      }
+    } catch {
+    }
+    try {
+      const res = await fetch("https://evilquest.net/api/world-map", { credentials: "same-origin" });
+      if (!res.ok) return;
+      const m = (await res.json())?.map;
+      if (!m || !Array.isArray(m.npcSpawns)) return;
+      this.apiSpawns = m.npcSpawns.map((s) => ({ x: +s.x, z: +s.z, floor: s.floor | 0, npcId: s.npcId | 0, name: (s.name ?? "") + "" }));
+      if (Array.isArray(m.tileRows)) this.apiTileRows = m.tileRows;
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify({ fetchedAt: Date.now(), updatedAt: m.updatedAt, spawns: this.apiSpawns, rows: this.apiTileRows }));
+      } catch {
+      }
+      this.afterApiLoad();
+    } catch {
+    }
+  }
+  /** Re-render whatever viewer is open once async API data lands. */
+  afterApiLoad() {
+    try {
+      if (this.worldCanvas) void this.seedWorldFromCaches(this.worldW, this.worldH, this.currentFloor);
+      const s = this.buildMapSnapshot();
+      if (s) this.pushToViewer({ full: s, p: s.p });
+    } catch {
+    }
+  }
+  /** Paint the authoritative full-map terrain (API `tileRows`) into the worldCanvas, filling every
+   *  tile the live/seed paint hasn't already covered (destination-over, so explored detail stays on
+   *  top). This makes the WHOLE map show in colour on login — no exploration needed — and the live
+   *  gm rebuild keeps adding finer detail (lighting/biome) on loaded tiles. Floor 0 only. */
+  applyApiTerrain() {
+    const rows = this.apiTileRows, cv = this.worldCanvas, ctx = this.worldCtx;
+    if (!rows || !cv || !ctx || this.currentFloor !== 0 || rows.length < cv.height) return;
+    const W = cv.width, H = cv.height;
+    const tmp = document.createElement("canvas");
+    tmp.width = W;
+    tmp.height = H;
+    const tctx = tmp.getContext("2d");
+    if (!tctx) return;
+    const img = tctx.createImageData(W, H);
+    const d = img.data;
+    const CC = _WorldMapPlugin.TILE_CHAR_COLOR;
+    const cl = (v) => v < 0 ? 0 : v > 255 ? 255 : v | 0;
+    for (let z = 0; z < H; z++) {
+      const row = rows[z];
+      if (!row) continue;
+      for (let x = 0; x < W && x < row.length; x++) {
+        const ch = row[x], c = CC[ch];
+        if (!c) continue;
+        const o = (z * W + x) * 4;
+        if (ch === "w") {
+          const n = ((x * 3 * 73856093 ^ z * 7 * 19349663) & 255) / 255 * 6 - 3;
+          d[o] = cl(c[0] + n * 0.5);
+          d[o + 1] = cl(c[1] + n * 0.3);
+          d[o + 2] = cl(c[2] + n * 0.2);
+        } else {
+          const n = ((x * 73856093 ^ z * 19349663) & 255) / 255 * 6 - 3;
+          d[o] = cl(c[0] + n);
+          d[o + 1] = cl(c[1] + n);
+          d[o + 2] = cl(c[2] + n);
+        }
+        d[o + 3] = 255;
+      }
+    }
+    tctx.putImageData(img, 0, 0);
+    ctx.save();
+    ctx.globalCompositeOperation = "destination-over";
+    ctx.drawImage(tmp, 0, 0);
+    ctx.restore();
+    this.terrainUrl = "";
+    this.terrainDirty = true;
   }
   /** Gather a full, self-contained snapshot of the explored map (terrain PNG + deduped
    *  icons + per-tile markers + categories + POIs + the player position). Used by both
@@ -1260,6 +1416,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     const npc = this.liveNpcs.filter((n) => (n.floor ?? 0) === this.currentFloor).map((n) => ({ x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0, i: idxOf(this.getNpcIcon(n.defId)) }));
     const pl = this.players.map((p) => ({ x: p.x, z: p.z, n: p.name }));
     const ns = this.buildNpcSightings(this.currentFloor, (d) => idxOf(this.getNpcIcon(d)));
+    this.lastIconIdx = iconIdx;
     const wl = [];
     const ww = this.worldWalls;
     for (let z2 = 0; z2 < H; z2++) {
@@ -1281,7 +1438,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
       pi: pois,
       mm: mmIcons,
       floor: this.currentFloor,
-      p: player ? { x: player.x, z: player.z } : null,
+      p: player ? { x: player.x, z: player.z, a: this.getPlayerAngle() } : null,
       npc,
       ns,
       pl,
@@ -1327,6 +1484,81 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
   terrainScore(b) {
     if (!b) return 0;
     return (typeof b.t === "string" ? b.t.length : 0) + (Array.isArray(b.wl) ? b.wl.length * 8 : 0);
+  }
+  /** Persist the terrain (+ walls) to the offline bundle whenever the canvas changes — so walking
+   *  to fill in terrain detail is cached like objects/walls. (saveOfflineBundle, the full-snapshot
+   *  path, only fires when a MARKER changes; terrain alone never triggered it, so explored terrain
+   *  was lost on reload/logout — issue: terrain not cached like other assets.) Keeps the previously
+   *  saved objects/icons/markers and is downgrade-guarded so a mid-teardown blank can't clobber it. */
+  persistTerrainToBundle() {
+    if (!this.terrainSeeded || !this.worldW || !this.worldH) return;
+    const id = this.mapId || "world", floor = this.currentFloor, W = this.worldW, H = this.worldH;
+    const t = this.encodeWorldTerrain();
+    if (!t) return;
+    const wl = [];
+    const ww = this.worldWalls;
+    if (ww) for (let z = 0; z < H; z++) for (let x = 0; x < W; x++) {
+      const k = z * W + x;
+      if (ww[k]) wl.push(x, z, ww[k]);
+    }
+    const prev = this.loadOfflineBundle();
+    const b = prev && prev.id === id && prev.floor === floor ? { ...prev } : { id, floor };
+    b.id = id;
+    b.floor = floor;
+    b.W = W;
+    b.H = H;
+    b.t = t;
+    b.wl = wl;
+    try {
+      localStorage.setItem("eq_wm_offline", JSON.stringify(b));
+    } catch {
+    }
+    const now = Date.now();
+    if (now - this.lastTerrainBake > 3e4) {
+      this.lastTerrainBake = now;
+      try {
+        this.terrainCacheStore.save(`${id}:${floor}`, JSON.stringify(b));
+      } catch {
+      }
+    }
+  }
+  /** Encode the per-tile terrain store to a PNG (unpainted tiles transparent) — the persisted
+   *  terrain: real explored tiles only, no API fill, monotonic so it can never lose detail. */
+  encodeWorldTerrain() {
+    const W = this.worldW, H = this.worldH, wt = this.worldTerrain;
+    if (!W || !H || wt.length !== W * H) return "";
+    const c = document.createElement("canvas");
+    c.width = W;
+    c.height = H;
+    const ctx = c.getContext("2d");
+    if (!ctx) return "";
+    const img = ctx.createImageData(W, H);
+    const d = img.data;
+    for (let k = 0; k < wt.length; k++) {
+      const v = wt[k];
+      if (!v) continue;
+      const o = k * 4;
+      d[o] = v >> 16 & 255;
+      d[o + 1] = v >> 8 & 255;
+      d[o + 2] = v & 255;
+      d[o + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    try {
+      return c.toDataURL("image/png");
+    } catch {
+      return "";
+    }
+  }
+  /** Restore the per-tile terrain store from previously-saved image pixels — accumulates (only
+   *  sets opaque pixels, never clears an existing tile). */
+  restoreWorldTerrain(d) {
+    const wt = this.worldTerrain;
+    for (let k = 0; k < wt.length; k++) {
+      const o = k * 4;
+      if (d[o + 3] < 10) continue;
+      wt[k] = 4278190080 | d[o] << 16 | d[o + 1] << 8 | d[o + 2];
+    }
   }
   /** Pull the shipped terrain prebake (build-committed full map) into memory once, so the
    *  offline snapshot can use it synchronously as a fallback. Safe to call repeatedly. */
@@ -1680,9 +1912,13 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
       if (!this.viewerOpen()) return;
       this.refreshData();
       const p = this.getPlayerPos();
-      const npc = this.liveNpcs.filter((n) => (n.floor ?? 0) === this.currentFloor).map((n) => ({ x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0 }));
+      const npc = this.liveNpcs.filter((n) => (n.floor ?? 0) === this.currentFloor).map((n) => {
+        const im = this.getNpcIcon(n.defId);
+        const i = im && im.complete && im.naturalWidth && im.src.startsWith("data:") && this.lastIconIdx ? this.lastIconIdx.get(im.src) ?? -1 : -1;
+        return { x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0, i };
+      });
       const pl = this.players.map((q) => ({ x: q.x, z: q.z, n: q.name }));
-      this.pushToViewer({ p: p ? { x: p.x, z: p.z } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
+      this.pushToViewer({ p: p ? { x: p.x, z: p.z, a: this.getPlayerAngle() } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
     }, 280);
     this.mapWindowFullTimer = setInterval(() => {
       if (!this.viewerOpen()) return;
@@ -1719,8 +1955,8 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
     if (this.terrainEncoding) return;
     const cm = this.getChunkManager();
     if (!cm || !this.rebuildWorldCanvas(cm) || !this.worldCanvas) return;
-    const sig = this.worldW + "x" + this.worldH + ":" + this.lastPaintedSize + ":" + this.currentFloor;
-    if (sig === this.terrainUrlSig) return;
+    if (!this.terrainDirty) return;
+    this.terrainDirty = false;
     this.terrainEncoding = true;
     try {
       this.worldCanvas.toBlob((blob) => {
@@ -1729,8 +1965,8 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
         const fr = new FileReader();
         fr.onload = () => {
           this.terrainUrl = fr.result;
-          this.terrainUrlSig = sig;
           this.pushToViewer({ terrain: this.terrainUrl });
+          this.persistTerrainToBundle();
         };
         fr.onerror = () => {
         };
@@ -1738,6 +1974,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
       }, "image/png");
     } catch {
       this.terrainEncoding = false;
+      this.terrainDirty = true;
     }
   }
   /** A self-contained interactive viewer that re-renders the exported data exactly like
@@ -1746,7 +1983,7 @@ var _WorldMapPlugin = class _WorldMapPlugin extends Plugin {
    *  (used by the detached map window). */
   buildExportHtml(data, live = false) {
     const json = JSON.stringify(data);
-    return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EvilQuest World Map - ' + data.id + '</title><style>html,body{margin:0;height:100%;background:#111;color:#eee;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden}#app{display:flex;height:100%}#side{width:220px;flex:none;background:#1b1b1b;border-right:1px solid #333;display:flex;flex-direction:column}#side h1{font-size:14px;margin:0;padding:10px 12px;border-bottom:1px solid #333}#q{margin:8px;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#111;color:#fff}#layers{padding:6px 12px;border-bottom:1px solid #333}#layers label,#cats label{display:block;padding:3px 0;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#cats{overflow:auto;flex:1;padding:6px 10px}#cats .cat{margin-bottom:1px}#cats .chead{display:flex;align-items:center;padding:3px 0}#cats .chead .cn{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default}#cats .exp{cursor:pointer;padding:0 5px;color:#9aa;user-select:none}#cats .subs{padding-left:20px}#cats .sub{display:block;padding:2px 0;font-size:12px;color:#bbb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}#cats .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 6px;vertical-align:middle}#cats .ci{width:20px;height:20px;object-fit:contain;vertical-align:middle;margin:0 5px;flex:none}#cats .sub .ci{width:16px;height:16px}#view{flex:1;position:relative;overflow:hidden;background:#0a0a0a;cursor:grab}#view.drag{cursor:grabbing}#c{position:absolute;inset:0}#tip{position:absolute;background:#000d;border:1px solid #444;border-radius:4px;padding:4px 7px;font-size:12px;pointer-events:none;display:none;max-width:240px}#hint{position:absolute;right:8px;bottom:8px;background:#000a;padding:4px 8px;border-radius:4px;font-size:11px;pointer-events:none}</style></head><body><div id="app"><div id="side"><h1>World Map - ' + data.id + '</h1><input id="q" placeholder="Search..."><div id="layers"><label><input type="checkbox" id="L_ic" checked> Model icons</label><label><input type="checkbox" id="L_poi" checked> Minimap markers</label><label><input type="checkbox" id="L_lab"> Labels</label></div><div id="cats"></div></div><div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan - scroll to zoom</div></div></div><script>(function(){var D=' + json + ';var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");var terrain=new Image();terrain.src=D.t;var ICONS=D.ic.map(function(s){var i=new Image();i.src=s;return i;});var MM=D.mm.map(function(s){var i=new Image();i.src=s;return i;});var ICONS_S=new Array(ICONS.length);function shadowed(idx){if(ICONS_S[idx])return ICONS_S[idx];var im=ICONS[idx];if(!im||!im.complete||!im.naturalWidth)return null;var pad=4;var c=document.createElement("canvas");c.width=im.naturalWidth+pad*2;c.height=im.naturalHeight+pad*2;var x=c.getContext("2d");x.shadowColor="rgba(0,0,0,.55)";x.shadowBlur=2;x.drawImage(im,pad,pad);ICONS_S[idx]=c;return c;}var TAX={},nameOn={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});Object.keys(TAX).forEach(function(c){Object.keys(TAX[c]).forEach(function(n){nameOn[c+"|"+n]=true;});});var showIcons=true,showPoi=true,showLab=false;var cx=D.W/2,cz=D.H/2,Z=4,W=0,Hh=0,hits=[];function resize(){var r=view.getBoundingClientRect();W=cv.width=Math.floor(r.width);Hh=cv.height=Math.floor(r.height);render();}function clamp(v,a,b){return Math.max(a,Math.min(v,b));}function render(){if(!W)return;hits=[];ctx.fillStyle="#0a0a0a";ctx.fillRect(0,0,W,Hh);var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);if(terrain.complete&&terrain.naturalWidth){ctx.imageSmoothingEnabled=true;ctx.save();ctx.translate(-sl*Z,-st*Z);ctx.scale(Z,Z);ctx.drawImage(terrain,0,0);ctx.restore();}if(D.wl&&D.wl.length){ctx.fillStyle="rgb(220,216,200)";var wt=Math.max(1.5,Z*0.15);for(var wi=0;wi<D.wl.length;wi+=3){var wx=D.wl[wi],wz=D.wl[wi+1],wf=D.wl[wi+2];var wsx=(wx-sl)*Z,wsy=(wz-st)*Z;if(wsx<-Z||wsx>W+Z||wsy<-Z||wsy>Hh+Z)continue;if(wf&1)ctx.fillRect(wsx,wsy,Z,wt);if(wf&4)ctx.fillRect(wsx,wsy+Z-wt,Z,wt);if(wf&8)ctx.fillRect(wsx,wsy,wt,Z);if(wf&2)ctx.fillRect(wsx+Z-wt,wsy,wt,Z);}}if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x-sl)*Z,sy=(o.z-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;var hr;var sc=o.i>=0?shadowed(o.i):null;if(sc){var iim=ICONS[o.i];var sz=clamp(Z*3,24,50);var k=sz/iim.naturalWidth,dw=sc.width*k,dh=sc.height*k;ctx.globalAlpha=o.d?0.45:1;ctx.drawImage(sc,sx-dw/2,sy-dh/2,dw,dh);ctx.globalAlpha=1;hr=sz/2;}else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);ctx.fillStyle=col;ctx.globalAlpha=o.d?0.4:1;ctx.beginPath();ctx.arc(sx,sy,br,0,6.28);ctx.fill();ctx.globalAlpha=1;hr=br;}if(o.k>1){ctx.fillStyle="#c0392b";ctx.beginPath();ctx.arc(sx+hr*0.8,sy-hr*0.8,6,0,6.28);ctx.fill();ctx.fillStyle="#fff";ctx.font="9px sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(o.k>9?"9+":""+o.k,sx+hr*0.8,sy-hr*0.8);}hits.push({sx:sx,sy:sy,r:hr,n:o.n+(o.k>1?" +"+(o.k-1):""),s:o.c+" - "+o.x+","+o.z});if(showLab){ctx.fillStyle="#fff";ctx.font="11px sans-serif";ctx.textAlign="center";ctx.textBaseline="bottom";ctx.shadowColor="#000";ctx.shadowBlur=3;ctx.fillText(o.n,sx,sy-hr-2);ctx.shadowBlur=0;}}}if(showPoi){for(var p=0;p<D.pi.length;p++){var P=D.pi[p];var px=(P.x-sl)*Z,py=(P.z-st)*Z;if(px<-30||px>W+30||py<-30||py>Hh+30)continue;var u=P.s;ctx.save();ctx.globalAlpha=0.7;ctx.fillStyle="rgba(0,0,0,.68)";ctx.beginPath();ctx.arc(px,py,u*0.55,0,6.28);ctx.fill();ctx.restore();if(P.m>=0&&MM[P.m].complete&&MM[P.m].naturalWidth)ctx.drawImage(MM[P.m],px-u/2,py-u/2,u,u);hits.push({sx:px,sy:py,r:u/2,n:P.n,s:P.x+","+P.z});}}if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}}function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}var dragging=false,lx=0,ly=0,moved=false;view.addEventListener("mousedown",function(e){if(e.button!==0)return;dragging=true;moved=false;lx=e.clientX;ly=e.clientY;view.classList.add("drag");});window.addEventListener("mouseup",function(){dragging=false;view.classList.remove("drag");});view.addEventListener("mousemove",function(e){if(dragging){var dx=e.clientX-lx,dy=e.clientY-ly;if(Math.abs(dx)+Math.abs(dy)>2)moved=true;cx-=dx/Z;cz-=dy/Z;lx=e.clientX;ly=e.clientY;render();tip.style.display="none";return;}var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});function goTo(x,z){Z=Math.max(Z,16);cx=x+0.5;cz=z+0.5;render();}function buildTax(){var box=document.getElementById("cats");box.innerHTML="";var esc=function(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;};var catIcon={},nameIcon={};D.ob.forEach(function(o){if(o.i>=0){if(catIcon[o.c]===undefined)catIcon[o.c]=o.i;if(nameIcon[o.c+"|"+o.n]===undefined)nameIcon[o.c+"|"+o.n]=o.i;}});var swatch=function(i,col){return i!==undefined?"<img class=ci src=\\""+D.ic[i]+"\\">":"<span class=sw style=background:"+col+"></span>";};Object.keys(TAX).sort().forEach(function(c){var col=(D.ct.filter(function(x){return x.n==c;})[0]||{c:"#ffd24a"}).c;var names=Object.keys(TAX[c]).sort();var tot=0;names.forEach(function(n){tot+=TAX[c][n];});var g=document.createElement("div");g.className="cat";var head=document.createElement("div");head.className="chead";head.innerHTML="<input type=checkbox class=cc checked>"+swatch(catIcon[c],col)+"<span class=cn>"+esc(c)+" ("+tot+")</span><span class=exp>\\u25b8</span>";var subs=document.createElement("div");subs.className="subs";subs.style.display="none";names.forEach(function(n){var l=document.createElement("label");l.className="sub";l.innerHTML="<input type=checkbox class=nc checked>"+swatch(nameIcon[c+"|"+n],col)+esc(n)+" ("+TAX[c][n]+")";var nb=l.querySelector("input");nb.onchange=function(){nameOn[c+"|"+n]=nb.checked;var any=names.some(function(x){return nameOn[c+"|"+x]!==false;});head.querySelector(".cc").checked=any;render();};subs.appendChild(l);});var cc=head.querySelector(".cc");cc.onchange=function(){var on=cc.checked;names.forEach(function(n){nameOn[c+"|"+n]=on;});subs.querySelectorAll(".nc").forEach(function(x){x.checked=on;});render();};head.querySelector(".exp").onclick=function(){var open=subs.style.display==="none";subs.style.display=open?"block":"none";this.textContent=open?"\\u25be":"\\u25b8";};g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}document.getElementById("L_ic").onchange=function(e){showIcons=e.target.checked;render();};document.getElementById("L_poi").onchange=function(e){showPoi=e.target.checked;render();};document.getElementById("L_lab").onchange=function(e){showLab=e.target.checked;render();};q.oninput=function(){var s=q.value.trim().toLowerCase();if(!s)return;var best=null,bd=1e9;function consider(x,z,n){if(n.toLowerCase().indexOf(s)<0)return;var d=(x-cx)*(x-cx)+(z-cz)*(z-cz);if(d<bd){bd=d;best=[x,z];}}D.ob.forEach(function(o){consider(o.x,o.z,o.n+" "+o.c);});D.pi.forEach(function(P){consider(P.x,P.z,P.n);});if(best)goTo(best[0],best[1]);};buildTax();window.addEventListener("resize",resize);var ld=0;[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",function(){if(++ld%40==0)render();});});setTimeout(render,400);setTimeout(render,1500);' + (live ? 'var follow=true;if(window.electron&&window.electron.ipcRenderer&&window.electron.ipcRenderer.on){window.electron.ipcRenderer.on("map-window:update",function(e,u){if(!u)return;if(u.full){var nd=u.full;D.t=nd.t;terrain=new Image();terrain.src=D.t;D.ic=nd.ic;ICONS=D.ic.map(function(s){var i=new Image();i.src=s;return i;});D.ob=nd.ob;D.ct=nd.ct;D.pi=nd.pi;D.mm=nd.mm;MM=D.mm.map(function(s){var i=new Image();i.src=s;return i;});D.W=nd.W;D.H=nd.H;TAX={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});Object.keys(TAX).forEach(function(c){Object.keys(TAX[c]).forEach(function(n){if(nameOn[c+"|"+n]===undefined)nameOn[c+"|"+n]=true;});});buildTax();}if(u.p!==undefined){D.p=u.p;if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}}render();});}var fb=document.createElement("label");fb.style.cssText="display:block;padding:3px 0;cursor:pointer";fb.innerHTML="<input type=checkbox id=L_follow checked> Follow player";document.getElementById("layers").appendChild(fb);document.getElementById("L_follow").onchange=function(e){follow=e.target.checked;if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}};view.addEventListener("mousedown",function(){var fc=document.getElementById("L_follow");if(fc&&fc.checked){fc.checked=false;follow=false;}});' : "") + "resize();fit();})();<\/script></body></html>";
+    return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EvilQuest World Map - ' + data.id + '</title><style>html,body{margin:0;height:100%;background:#111;color:#eee;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden}#app{display:flex;height:100%}#side{width:220px;flex:none;background:#1b1b1b;border-right:1px solid #333;display:flex;flex-direction:column}#side h1{font-size:14px;margin:0;padding:10px 12px;border-bottom:1px solid #333}#q{margin:8px;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#111;color:#fff}#layers{padding:6px 12px;border-bottom:1px solid #333}#layers label,#cats label{display:block;padding:3px 0;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#cats{overflow:auto;flex:1;padding:6px 10px}#cats .cat{margin-bottom:1px}#cats .chead{display:flex;align-items:center;padding:3px 0}#cats .chead .cn{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default}#cats .exp{cursor:pointer;padding:0 5px;color:#9aa;user-select:none}#cats .subs{padding-left:20px}#cats .sub{display:block;padding:2px 0;font-size:12px;color:#bbb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}#cats .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 6px;vertical-align:middle}#cats .ci{width:20px;height:20px;object-fit:contain;vertical-align:middle;margin:0 5px;flex:none}#cats .sub .ci{width:16px;height:16px}#view{flex:1;position:relative;overflow:hidden;background:#0a0a0a;cursor:grab}#view.drag{cursor:grabbing}#c{position:absolute;inset:0}#tip{position:absolute;background:#000d;border:1px solid #444;border-radius:4px;padding:4px 7px;font-size:12px;pointer-events:none;display:none;max-width:240px}#hint{position:absolute;right:8px;bottom:8px;background:#000a;padding:4px 8px;border-radius:4px;font-size:11px;pointer-events:none}</style></head><body><div id="app"><div id="side"><h1>World Map - ' + data.id + '</h1><input id="q" placeholder="Search..."><div id="layers"><label><input type="checkbox" id="L_ic" checked> Model icons</label><label><input type="checkbox" id="L_poi" checked> Minimap markers</label><label><input type="checkbox" id="L_lab"> Labels</label></div><div id="cats"></div></div><div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan - scroll to zoom</div></div></div><script>(function(){var D=' + json + ';var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");var terrain=new Image();terrain.src=D.t;var ICONS=D.ic.map(function(s){var i=new Image();i.src=s;return i;});var MM=D.mm.map(function(s){var i=new Image();i.src=s;return i;});var ICONS_S=new Array(ICONS.length);function shadowed(idx){if(ICONS_S[idx])return ICONS_S[idx];var im=ICONS[idx];if(!im||!im.complete||!im.naturalWidth)return null;var pad=4;var c=document.createElement("canvas");c.width=im.naturalWidth+pad*2;c.height=im.naturalHeight+pad*2;var x=c.getContext("2d");x.shadowColor="rgba(0,0,0,.55)";x.shadowBlur=2;x.drawImage(im,pad,pad);ICONS_S[idx]=c;return c;}var TAX={},nameOn={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});Object.keys(TAX).forEach(function(c){Object.keys(TAX[c]).forEach(function(n){nameOn[c+"|"+n]=true;});});var showIcons=true,showPoi=true,showLab=false;var cx=D.W/2,cz=D.H/2,Z=4,W=0,Hh=0,hits=[];function resize(){var r=view.getBoundingClientRect();W=cv.width=Math.floor(r.width);Hh=cv.height=Math.floor(r.height);render();}function clamp(v,a,b){return Math.max(a,Math.min(v,b));}function render(){if(!W)return;hits=[];ctx.fillStyle="#0a0a0a";ctx.fillRect(0,0,W,Hh);var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);if(terrain.complete&&terrain.naturalWidth){ctx.imageSmoothingEnabled=true;ctx.save();ctx.translate(-sl*Z,-st*Z);ctx.scale(Z,Z);ctx.drawImage(terrain,0,0);ctx.restore();}if(D.wl&&D.wl.length){ctx.fillStyle="rgb(220,216,200)";var wt=Math.max(1.5,Z*0.15);for(var wi=0;wi<D.wl.length;wi+=3){var wx=D.wl[wi],wz=D.wl[wi+1],wf=D.wl[wi+2];var wsx=(wx-sl)*Z,wsy=(wz-st)*Z;if(wsx<-Z||wsx>W+Z||wsy<-Z||wsy>Hh+Z)continue;if(wf&1)ctx.fillRect(wsx,wsy,Z,wt);if(wf&4)ctx.fillRect(wsx,wsy+Z-wt,Z,wt);if(wf&8)ctx.fillRect(wsx,wsy,wt,Z);if(wf&2)ctx.fillRect(wsx+Z-wt,wsy,wt,Z);}}if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x-sl)*Z,sy=(o.z-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;var hr;var sc=o.i>=0?shadowed(o.i):null;if(sc){var iim=ICONS[o.i];var sz=clamp(Z*3,24,50);var k=sz/iim.naturalWidth,dw=sc.width*k,dh=sc.height*k;ctx.globalAlpha=o.d?0.45:1;ctx.drawImage(sc,sx-dw/2,sy-dh/2,dw,dh);ctx.globalAlpha=1;hr=sz/2;}else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);ctx.fillStyle=col;ctx.globalAlpha=o.d?0.4:1;ctx.beginPath();ctx.arc(sx,sy,br,0,6.28);ctx.fill();ctx.globalAlpha=1;hr=br;}if(o.k>1){ctx.fillStyle="#c0392b";ctx.beginPath();ctx.arc(sx+hr*0.8,sy-hr*0.8,6,0,6.28);ctx.fill();ctx.fillStyle="#fff";ctx.font="9px sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(o.k>9?"9+":""+o.k,sx+hr*0.8,sy-hr*0.8);}hits.push({sx:sx,sy:sy,r:hr,n:o.n+(o.k>1?" +"+(o.k-1):""),s:o.c+" - "+o.x+","+o.z});if(showLab){ctx.fillStyle="#fff";ctx.font="11px sans-serif";ctx.textAlign="center";ctx.textBaseline="bottom";ctx.shadowColor="#000";ctx.shadowBlur=3;ctx.fillText(o.n,sx,sy-hr-2);ctx.shadowBlur=0;}}}if(showPoi){for(var p=0;p<D.pi.length;p++){var P=D.pi[p];var px=(P.x-sl)*Z,py=(P.z-st)*Z;if(px<-30||px>W+30||py<-30||py>Hh+30)continue;var u=P.s;ctx.save();ctx.globalAlpha=0.7;ctx.fillStyle="rgba(0,0,0,.68)";ctx.beginPath();ctx.arc(px,py,u*0.55,0,6.28);ctx.fill();ctx.restore();if(P.m>=0&&MM[P.m].complete&&MM[P.m].naturalWidth)ctx.drawImage(MM[P.m],px-u/2,py-u/2,u,u);hits.push({sx:px,sy:py,r:u/2,n:P.n,s:P.x+","+P.z});}}if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}}function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}var dragging=false,lx=0,ly=0,moved=false;view.addEventListener("mousedown",function(e){if(e.button!==0)return;dragging=true;moved=false;lx=e.clientX;ly=e.clientY;view.classList.add("drag");});window.addEventListener("mouseup",function(){dragging=false;view.classList.remove("drag");});view.addEventListener("mousemove",function(e){if(dragging){var dx=e.clientX-lx,dy=e.clientY-ly;if(Math.abs(dx)+Math.abs(dy)>2)moved=true;cx-=dx/Z;cz-=dy/Z;lx=e.clientX;ly=e.clientY;render();tip.style.display="none";return;}var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};if(D.online){var itm2=document.createElement("div");itm2.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm2.textContent="Walk Here";itm2.onmouseenter=function(){itm2.style.background="#5c5040";};itm2.onmouseleave=function(){itm2.style.background="transparent";};itm2.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"move",x:wx,z:wz});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"move",x:wx,z:wz});}};m.appendChild(itm2);}m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});function goTo(x,z){Z=Math.max(Z,16);cx=x+0.5;cz=z+0.5;render();}function buildTax(){var box=document.getElementById("cats");box.innerHTML="";var esc=function(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;};var catIcon={},nameIcon={};D.ob.forEach(function(o){if(o.i>=0){if(catIcon[o.c]===undefined)catIcon[o.c]=o.i;if(nameIcon[o.c+"|"+o.n]===undefined)nameIcon[o.c+"|"+o.n]=o.i;}});var swatch=function(i,col){return i!==undefined?"<img class=ci src=\\""+D.ic[i]+"\\">":"<span class=sw style=background:"+col+"></span>";};Object.keys(TAX).sort().forEach(function(c){var col=(D.ct.filter(function(x){return x.n==c;})[0]||{c:"#ffd24a"}).c;var names=Object.keys(TAX[c]).sort();var tot=0;names.forEach(function(n){tot+=TAX[c][n];});var g=document.createElement("div");g.className="cat";var head=document.createElement("div");head.className="chead";head.innerHTML="<input type=checkbox class=cc checked>"+swatch(catIcon[c],col)+"<span class=cn>"+esc(c)+" ("+tot+")</span><span class=exp>\\u25b8</span>";var subs=document.createElement("div");subs.className="subs";subs.style.display="none";names.forEach(function(n){var l=document.createElement("label");l.className="sub";l.innerHTML="<input type=checkbox class=nc checked>"+swatch(nameIcon[c+"|"+n],col)+esc(n)+" ("+TAX[c][n]+")";var nb=l.querySelector("input");nb.onchange=function(){nameOn[c+"|"+n]=nb.checked;var any=names.some(function(x){return nameOn[c+"|"+x]!==false;});head.querySelector(".cc").checked=any;render();};subs.appendChild(l);});var cc=head.querySelector(".cc");cc.onchange=function(){var on=cc.checked;names.forEach(function(n){nameOn[c+"|"+n]=on;});subs.querySelectorAll(".nc").forEach(function(x){x.checked=on;});render();};head.querySelector(".exp").onclick=function(){var open=subs.style.display==="none";subs.style.display=open?"block":"none";this.textContent=open?"\\u25be":"\\u25b8";};g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}document.getElementById("L_ic").onchange=function(e){showIcons=e.target.checked;render();};document.getElementById("L_poi").onchange=function(e){showPoi=e.target.checked;render();};document.getElementById("L_lab").onchange=function(e){showLab=e.target.checked;render();};q.oninput=function(){var s=q.value.trim().toLowerCase();if(!s)return;var best=null,bd=1e9;function consider(x,z,n){if(n.toLowerCase().indexOf(s)<0)return;var d=(x-cx)*(x-cx)+(z-cz)*(z-cz);if(d<bd){bd=d;best=[x,z];}}D.ob.forEach(function(o){consider(o.x,o.z,o.n+" "+o.c);});D.pi.forEach(function(P){consider(P.x,P.z,P.n);});if(best)goTo(best[0],best[1]);};buildTax();window.addEventListener("resize",resize);var ld=0;[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",function(){if(++ld%40==0)render();});});setTimeout(render,400);setTimeout(render,1500);' + (live ? 'var follow=true;if(window.electron&&window.electron.ipcRenderer&&window.electron.ipcRenderer.on){window.electron.ipcRenderer.on("map-window:update",function(e,u){if(!u)return;if(u.full){var nd=u.full;D.t=nd.t;terrain=new Image();terrain.src=D.t;D.ic=nd.ic;ICONS=D.ic.map(function(s){var i=new Image();i.src=s;return i;});D.ob=nd.ob;D.ct=nd.ct;D.pi=nd.pi;D.mm=nd.mm;MM=D.mm.map(function(s){var i=new Image();i.src=s;return i;});D.W=nd.W;D.H=nd.H;TAX={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});Object.keys(TAX).forEach(function(c){Object.keys(TAX[c]).forEach(function(n){if(nameOn[c+"|"+n]===undefined)nameOn[c+"|"+n]=true;});});buildTax();}if(u.p!==undefined){D.p=u.p;if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}}render();});}var fb=document.createElement("label");fb.style.cssText="display:block;padding:3px 0;cursor:pointer";fb.innerHTML="<input type=checkbox id=L_follow checked> Follow player";document.getElementById("layers").appendChild(fb);document.getElementById("L_follow").onchange=function(e){follow=e.target.checked;if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}};view.addEventListener("mousedown",function(){var fc=document.getElementById("L_follow");if(fc&&fc.checked){fc.checked=false;follow=false;}});' : "") + "resize();fit();})();<\/script></body></html>";
   }
   /** The detached map window's viewer. Renders the live snapshot locally (terrain, icons,
    *  POIs, NPCs, players, player marker) with the in-game overlay's controls (search, floor
@@ -1854,15 +2091,18 @@ function drawNpc(N,alpha,tag){var nx=(N.x-sl)*Z,ny=(N.z-st)*Z;if(nx<-20||nx>W+20
 var nii=(N.i!==undefined&&N.i>=0)?N.i:(npcIcon[N.n]!==undefined?npcIcon[N.n]:-1);var nsc=nii>=0?shadowed(nii):null;var nhr;ctx.globalAlpha=alpha;
 if(nsc){var nim=ICONS[nii];var nsz=clamp(Z*2.6,20,44);var nk=nsz/nim.naturalWidth,ndw=nsc.width*nk,ndh=nsc.height*nk;ctx.drawImage(nsc,nx-ndw/2,ny-ndh/2,ndw,ndh);nhr=nsz/2;}
 else{ctx.fillStyle=tag==="live"?"#f1c40f":"#9aa0a6";ctx.strokeStyle="rgba(0,0,0,.6)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(nx,ny,4,0,6.28);ctx.fill();ctx.stroke();nhr=5;}
-ctx.globalAlpha=1;hits.push({sx:nx,sy:ny,r:nhr,n:N.n+(N.l?" (lv "+N.l+")":"")+(tag==="stored"?" \xB7 last seen":""),s:"NPC - "+N.x+","+N.z});}
+ctx.globalAlpha=1;hits.push({sx:nx,sy:ny,r:nhr,n:N.n+(N.l?" (lv "+N.l+")":"")+(tag==="stored"?" \xB7 spawn":""),s:"NPC - "+N.x+","+N.z});}
 if(npcMode>0){
 if(npcMode===1){var SN=D.ns||[];for(var si=0;si<SN.length;si++)drawNpc(SN[si],0.85,"stored");}
 else{var LV=D.npc||[],SN2=D.ns||[];
-for(var si2=0;si2<SN2.length;si2++){var S=SN2[si2],near=false;for(var li=0;li<LV.length;li++){var ddx=LV[li].x-S.x,ddz=LV[li].z-S.z;if(ddx*ddx+ddz*ddz<=16){near=true;break;}}if(!near)drawNpc(S,0.5,"stored");}
-for(var li2=0;li2<LV.length;li2++)drawNpc(LV[li2],1,"live");}}
+// A live NPC only takes over from its spawn ONCE its model icon is ready \u2014 until then we keep the
+// spawn marker (with its cached icon) and skip the live one, so there's no bare yellow dot on login.
+function npcReady(N){var ii=(N.i!==undefined&&N.i>=0)?N.i:(npcIcon[N.n]!==undefined?npcIcon[N.n]:-1);return ii>=0&&!!shadowed(ii);}
+for(var si2=0;si2<SN2.length;si2++){var S=SN2[si2],near=false;for(var li=0;li<LV.length;li++){if(!npcReady(LV[li]))continue;var ddx=LV[li].x-S.x,ddz=LV[li].z-S.z;if(ddx*ddx+ddz*ddz<=16){near=true;break;}}if(!near)drawNpc(S,0.5,"stored");}
+for(var li2=0;li2<LV.length;li2++){if(npcReady(LV[li2]))drawNpc(LV[li2],1,"live");}}}
 if(showPl&&D.pl){for(var pl2=0;pl2<D.pl.length;pl2++){var L=D.pl[pl2];var lx=(L.x-sl)*Z,ly=(L.z-st)*Z;if(lx<-10||lx>W+10||ly<-10||ly>Hh+10)continue;ctx.fillStyle="#2ecc71";ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.beginPath();ctx.arc(lx,ly,4,0,6.28);ctx.fill();ctx.stroke();hits.push({sx:lx,sy:ly,r:5,n:L.n,s:"Player - "+L.x+","+L.z});}}
 if(D.dest){var dsx=(D.dest.x-sl)*Z,dsy=(D.dest.z-st)*Z;drawDest(ctx,dsx,dsy);}
-if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}drawPings();}
+if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.translate(ppx,ppy);if(D.p.a!=null){ctx.rotate(D.p.a);ctx.fillStyle="#fff";ctx.strokeStyle="#1a1a1a";ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(0,-8);ctx.lineTo(5.5,7);ctx.lineTo(0,3.5);ctx.lineTo(-5.5,7);ctx.closePath();ctx.fill();ctx.stroke();}else{ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(0,0,6,0,6.28);ctx.fill();ctx.stroke();}ctx.restore();}drawPings();}
 var destT0=0,destRAF=null;
 function drawDest(t,e,i){var s=(performance.now()-destT0)/1000,n=(Math.sin(s*8)+1)*.5,o=Math.max(0,1-s/.55);t.save();t.translate(e,i);t.lineJoin="round";
 if(o>0){t.globalAlpha=.65*o;t.strokeStyle="#fff0b8";t.lineWidth=2;t.beginPath();t.arc(0,0,7+(1-o)*17,0,Math.PI*2);t.stroke();}
@@ -1894,7 +2134,7 @@ var dragging=false,pressed=false,sx0=0,sy0=0,lx0=0,ly0=0,pressT=0,DRAG_THRESH=18
 function clickAt(e){var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
 var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);var wx=sl+mx/Z,wz=st+my/Z;
-if(best){var m=best.s.match(/(-?\\d+),(-?\\d+)/);if(m){goTo(parseInt(m[1]),parseInt(m[2]));}}
+if(best){setFollow(false);var ox=sl+best.sx/Z,oz=st+best.sy/Z,hw=W/(2*Z),hh=Hh/(2*Z);cx=D.W>2*hw?Math.max(hw,Math.min(D.W-hw,ox)):D.W/2;cz=D.H>2*hh?Math.max(hh,Math.min(D.H-hh,oz)):D.H/2;render();}
 else if(D.online){sendInput({t:"move",x:wx,z:wz});}}
 view.addEventListener("mousedown",function(e){if(e.button!==0)return;pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
 window.addEventListener("mouseup",function(e){var pth=(e.composedPath&&e.composedPath())||[];var onView=view===e.target||view.contains(e.target)||pth.indexOf(view)>=0;if(pressed&&!dragging&&onView)clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
@@ -1902,7 +2142,7 @@ view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist
 var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
 view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});
-view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
+view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};if(D.online){var itm2=document.createElement("div");itm2.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm2.textContent="Walk Here";itm2.onmouseenter=function(){itm2.style.background="#5c5040";};itm2.onmouseleave=function(){itm2.style.background="transparent";};itm2.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"move",x:wx,z:wz});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"move",x:wx,z:wz});}};m.appendChild(itm2);}m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
 function setFollow(on){follow=on&&!!D.online;var b=document.getElementById("follow");b.className="btn"+(D.online?"":" dis")+(follow?"":" off");b.innerText=(follow?"\u25C9":"\u25CB")+" Follow";if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}}
 document.getElementById("follow").onclick=function(){if(!D.online)return;setFollow(!follow);};
 document.getElementById("fdown").onclick=function(){sendInput({t:"floor",f:(D.floor||0)-1});};
@@ -2273,6 +2513,10 @@ resize();fit();})();<\/script></body></html>`;
         }
       }
     }
+    if (!assetId) {
+      const mAsset = this.gm?.objectDefsCache?.get(o.defId)?.modelAssetId;
+      if (typeof mAsset === "string" && mAsset) assetId = mAsset;
+    }
     const key = assetId ? "obj:" + assetId : "objdef:" + o.defId;
     const icon = this.iconFor(key, () => this.objAssetFile(assetId) ?? this.objModelFiles?.get(o.defId) ?? null);
     if (icon) {
@@ -2617,12 +2861,14 @@ _WorldMapPlugin.CAT_COLOR = {
 };
 // ── Terrain rendering ─────────────────────────────────────────────────────────
 _WorldMapPlugin.T = { GRASS: 0, DIRT: 1, STONE: 2, WATER: 3, WALL: 4, SAND: 5, WOOD: 6, MUD: 7 };
-// Base tile-type colors — match game's `ga` table exactly.
+// Base tile-type colors. Values recovered exactly from the live minimap's tileColorBuf
+// (base = rendered colour minus the deterministic coordinate noise): GRASS/WATER/DIRT/MUD
+// verified against the running game; the rest keep the prior `ga`-table approximations.
 _WorldMapPlugin.TYPE_COLOR = {
-  0: [62, 140, 46],
-  1: [138, 104, 60],
+  0: [41, 137, 22],
+  1: [142, 98, 44],
   2: [130, 124, 114],
-  3: [44, 88, 142],
+  3: [43, 88, 141],
   4: [62, 140, 46],
   5: [196, 170, 106],
   6: [116, 82, 48],
@@ -2631,6 +2877,20 @@ _WorldMapPlugin.TYPE_COLOR = {
 _WorldMapPlugin.TEXTURED_COLOR = [138, 116, 82];
 // Nf
 _WorldMapPlugin.ROOF_COLOR = [96, 64, 34];
+// Server tileRows char -> colour. Matches the new gm base palette (TYPE_COLOR, recovered exactly
+// from the live minimap buffer) so the API-fill regions blend seamlessly into walked/gm-rendered
+// terrain instead of showing a lighter-green colour seam. p=path uses the textured colour,
+// m=mud a muted swamp green. (API fill has no height data, so it can't carry slope shading — those
+// regions gain the bump/shadow detail once the player walks them and the gm paints over.)
+_WorldMapPlugin.TILE_CHAR_COLOR = {
+  g: [41, 137, 22],
+  d: [142, 98, 44],
+  p: [138, 116, 82],
+  s: [196, 170, 106],
+  r: [130, 124, 114],
+  w: [43, 88, 141],
+  m: [78, 110, 52]
+};
 _WorldMapPlugin.RENDERS_PER_ENGINE = 20;
 /** Model file extensions Babylon's loader can import for our icons. The game's
  *  bought-asset packs (e.g. Medieval_Dracula: Lamp, Coffin, Notice Board) ship as
